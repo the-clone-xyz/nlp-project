@@ -1,0 +1,5 @@
+pandas>=1.0.0
+playwright>=1.40.0
+playwright_stealth>=2.0.0
+textblob>=0.17.0
+matplotlib>=3.5.0

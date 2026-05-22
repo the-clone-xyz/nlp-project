@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "review_text": "Ada masalah dengan produk ini?",
+    "rating": 0,
+    "sentiment": "neutral",
+    "date_scraped": "2026-05-18 21:58:31",
+    "text_length": 30,
+    "source": "tokopedia"
+  },
+  {
+    "id": 2,
+    "review_text": "Detail Produk",
+    "rating": 0,
+    "sentiment": "neutral",
+    "date_scraped": "2026-05-18 21:58:31",
+    "text_length": 13,
+    "source": "tokopedia"
+  }
+]

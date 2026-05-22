@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "review_text": "100 pembeli merasa puas",
+    "rating": 5,
+    "sentiment": "neutral",
+    "date_scraped": "2026-04-26 20:28:24",
+    "text_length": 23,
+    "source": "tokopedia"
+  },
+  {
+    "id": 2,
+    "review_text": "4.0 5.0 100 pembeli merasa puas 1 rating 0 ulasan 5 0 0 4 1 100 3 0 0 2 0 0 1 0 0",
+    "rating": 5,
+    "sentiment": "neutral",
+    "date_scraped": "2026-04-26 20:28:24",
+    "text_length": 81,
+    "source": "tokopedia"
+  }
+]

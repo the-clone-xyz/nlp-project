@@ -1,0 +1,1338 @@
+import asyncio
+import argparse
+import pandas as pd
+import re
+import random
+import json
+import hashlib
+import logging
+import os
+import sys
+from pathlib import Path
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import Stealth
+from datetime import datetime, timedelta
+from textblob import TextBlob
+from typing import List, Dict, Optional, Tuple
+import time
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# ==========================================
+# 0. LOGGING & CONFIG SETUP
+# ==========================================
+# Setup structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Cache configuration
+CACHE_DIR = Path("scraper_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_EXPIRY_HOURS = 24
+DEFAULT_TARGET_URL = "https://www.tokopedia.com/klaten-bersinar/torso-memandikan-jenasah-jenazah-manusia-model-torso-jenazah"
+
+class ScraperConfig:
+    """Configuration untuk scraper"""
+    MAX_RETRIES = 3
+    RETRY_DELAY_BASE = 2  # seconds
+    SCROLL_PAUSE_TIME = (0.5, 1.5)  # min, max
+    SCROLL_ITERATIONS = 15
+    ELEMENT_WAIT_TIMEOUT = 10000  # ms
+    PAGE_LOAD_TIMEOUT = 60000  # ms
+    RATE_LIMIT_DELAY = 2  # seconds between requests
+    MAX_CONCURRENT_TASKS = 2
+    MIN_REVIEW_TEXT_LENGTH = 5
+    REVIEW_LOAD_TIMEOUT = 90
+    HEADLESS = False
+
+config = ScraperConfig()
+
+# ==========================================
+# 1. DATA SANITIZATION & PREPROCESSING
+# ==========================================
+def sanitize_text(raw_text: str) -> str:
+    """Membersihkan teks ulasan dari karakter tidak aman, newline, dan spasi berlebih."""
+    if not raw_text:
+        return ""
+    # Remove HTML tags
+    clean_text = re.sub(r'<.*?>', '', raw_text)
+    # Remove emojis and special unicode characters (optional)
+    clean_text = re.sub(r'[^\w\s\u0600-\u06FF\u3040-\u309F\u4E00-\u9FFF.!?,;:-]', '', clean_text)
+    # Remove excessive newlines and carriage returns
+    clean_text = clean_text.replace('\n', ' ').replace('\r', '')
+    # Remove extra whitespace
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    return clean_text.strip()
+
+POSITIVE_WORDS = {
+    "bagus", "baik", "mantap", "cepat", "puas", "memuaskan", "awet",
+    "original", "ori", "oke", "ok", "sesuai", "murah", "rekomendasi",
+    "recommended", "rapi", "aman", "suka", "terbaik", "keren",
+    "berkualitas", "ramah", "berfungsi", "lancar", "kuat", "nyaman",
+    "praktis", "sempurna", "top", "worth", "cepet", "tepat", "jernih",
+    "halus", "solid", "lengkap", "terima", "kasih", "makasih"
+}
+
+NEGATIVE_WORDS = {
+    "jelek", "rusak", "kecewa", "mengecewakan", "lambat", "palsu",
+    "buruk", "cacat", "kurang", "parah", "mahal", "lama", "bohong",
+    "pecah", "gagal", "komplain", "tipis", "lemah", "error", "macet",
+    "retak", "lecet", "basah", "hancur", "telat", "terlambat", "batal",
+    "tipu", "zonk", "hilang", "salah", "kosong", "kotor", "penyok",
+    "sobek", "reject", "minus", "bermasalah"
+}
+
+NEGATIONS = {"tidak", "tak", "bukan", "ga", "gak", "nggak", "enggak", "belum"}
+INTENSIFIERS = {"sangat", "banget", "sekali", "amat", "super", "parah", "bener", "benar"}
+
+POSITIVE_PHRASES = {
+    "sesuai deskripsi": 2.0,
+    "pengiriman cepat": 2.0,
+    "barang sampai": 1.0,
+    "packing aman": 2.0,
+    "kualitas bagus": 2.0,
+    "harga murah": 1.5,
+    "berfungsi dengan baik": 2.0,
+    "terima kasih": 1.0,
+    "recommended seller": 2.0,
+}
+
+NEGATIVE_PHRASES = {
+    "tidak sesuai": -2.0,
+    "gak sesuai": -2.0,
+    "nggak sesuai": -2.0,
+    "barang rusak": -2.5,
+    "barang cacat": -2.5,
+    "pengiriman lama": -2.0,
+    "tidak berfungsi": -2.5,
+    "kurang bagus": -2.0,
+    "kecewa banget": -2.0,
+    "tidak original": -2.5,
+    "barang palsu": -3.0,
+    "salah kirim": -2.0,
+    "barang tidak sampai": -3.0,
+}
+
+NEUTRAL_PHRASES = {"biasa saja", "standar saja", "lumayan saja", "cukup saja"}
+
+REVIEW_NOISE_PATTERNS = [
+    r'^\d+\s+pembeli\s+merasa\s+puas$',
+    r'^\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+.*\brating\b.*\bulasan\b.*$',
+    r'^diambil\s+dari\s+tokopedia',
+    r'tiktok\s+shop\s+by\s+tokopedia',
+    r'^belum\s+ada\s+ulasan',
+    r'^lihat\s+semua\s+ulasan',
+    r'^tulis\s+ulasan',
+    r'^\d+\s+rating\b',
+    r'^\d+\s+ulasan\b',
+]
+
+def tokenize_text(text: str) -> List[str]:
+    """Tokenisasi ringan untuk ulasan Bahasa Indonesia."""
+    tokens = re.findall(r'[a-z0-9]+', text.lower())
+    return [re.sub(r'(.)\1{2,}', r'\1\1', token) for token in tokens]
+
+def is_probably_review_text(text: str) -> bool:
+    """Filter agar teks ringkasan/rating halaman tidak masuk sebagai ulasan."""
+    clean_text = sanitize_text(text)
+    if len(clean_text) < config.MIN_REVIEW_TEXT_LENGTH:
+        return False
+
+    lower = clean_text.lower()
+    for pattern in REVIEW_NOISE_PATTERNS:
+        if re.search(pattern, lower):
+            return False
+
+    tokens = tokenize_text(lower)
+    if len(tokens) < 2 and lower not in POSITIVE_WORDS and lower not in NEGATIVE_WORDS:
+        return False
+
+    digit_count = sum(ch.isdigit() for ch in lower)
+    if digit_count / max(len(lower), 1) > 0.35:
+        return False
+
+    summary_terms = [
+        "rating", "ulasan", "pembeli merasa puas", "terjual", "diskusi",
+        "diambil dari tokopedia", "tiktok shop"
+    ]
+    if sum(1 for term in summary_terms if term in lower) >= 2:
+        return False
+
+    return True
+
+def extract_rating(rating_text: str) -> int:
+    """Extract rating dari teks rating dengan validation."""
+    if not rating_text:
+        return 0
+    try:
+        # Cari angka di dalam teks (e.g., "5" atau "5.0")
+        match = re.search(r'(\d+(?:\.\d+)?)', rating_text.strip())
+        if match:
+            rating = int(float(match.group(1)))
+            # Validate rating range (1-5)
+            return max(1, min(5, rating))
+        return 0
+    except:
+        return 0
+
+def analyze_sentiment(text: str) -> str:
+    """Analisis sentimen ulasan Indonesia dengan lexicon dan fallback TextBlob."""
+    if not text or len(text) < 3:
+        return "neutral"
+
+    clean_text = sanitize_text(text).lower()
+    tokens = tokenize_text(clean_text)
+    score = 0.0
+
+    for phrase, value in POSITIVE_PHRASES.items():
+        if phrase in clean_text:
+            score += value
+
+    for phrase, value in NEGATIVE_PHRASES.items():
+        if phrase in clean_text:
+            score += value
+
+    for index, token in enumerate(tokens):
+        token_score = 0.0
+        if token in POSITIVE_WORDS:
+            token_score = 1.0
+        elif token in NEGATIVE_WORDS:
+            token_score = -1.0
+
+        if token_score == 0:
+            continue
+
+        previous_tokens = tokens[max(0, index - 2):index]
+        if any(prev in NEGATIONS for prev in previous_tokens):
+            token_score *= -1
+
+        if any(prev in INTENSIFIERS for prev in previous_tokens) or (
+            index + 1 < len(tokens) and tokens[index + 1] in INTENSIFIERS
+        ):
+            token_score *= 1.5
+
+        score += token_score
+
+    if any(phrase in clean_text for phrase in NEUTRAL_PHRASES) and abs(score) <= 1.5:
+        return "neutral"
+
+    if score >= 1.0:
+        return "positive"
+    if score <= -1.0:
+        return "negative"
+
+    try:
+        blob = TextBlob(clean_text)
+        polarity = blob.sentiment.polarity
+        
+        if polarity > 0.10:
+            return "positive"
+        elif polarity < -0.10:
+            return "negative"
+    except Exception as e:
+        logger.warning(f"Sentiment analysis error: {e}")
+
+    return "neutral"
+
+def compute_content_hash(text: str) -> str:
+    """Compute hash dari konten untuk deduplicasi yang lebih akurat."""
+    normalized = re.sub(r'\s+', ' ', sanitize_text(text).lower()).strip()
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+def validate_review(review_data: Dict) -> Tuple[bool, str]:
+    """Validate extracted review data."""
+    text = review_data.get('review_text', '').strip()
+    
+    if not is_probably_review_text(text):
+        return False, "Text is too short or looks like page summary/noise"
+    
+    # Check for valid sentiment
+    if review_data.get('sentiment') not in ['positive', 'negative', 'neutral']:
+        return False, "Invalid sentiment"
+    
+    # Check rating range
+    rating = review_data.get('rating', 0)
+    if not (0 <= rating <= 5):
+        return False, f"Invalid rating: {rating}"
+    
+    return True, "Valid"
+
+def score_review_candidate(text: str) -> float:
+    """Skor kandidat teks agar elemen ulasan murni diprioritaskan."""
+    lower = text.lower()
+    score = float(len(text))
+    if len(text) > 600:
+        score -= 200
+    if any(term in lower for term in ["rating", "ulasan", "pembeli merasa puas", "terjual"]):
+        score -= 100
+    if any(word in lower for word in POSITIVE_WORDS | NEGATIVE_WORDS):
+        score += 50
+    if any(term in lower for term in ["produk", "barang", "seller", "pengiriman", "packing", "paket", "sesuai"]):
+        score += 20
+    return score
+
+def is_strong_review_candidate(text: str) -> bool:
+    """Filter tambahan untuk fallback teks halaman agar tidak mengambil deskripsi produk."""
+    if not is_probably_review_text(text):
+        return False
+
+    lower = text.lower()
+    tokens = tokenize_text(lower)
+    if len(tokens) > 80:
+        return False
+
+    review_terms = {
+        "produk", "barang", "seller", "penjual", "pengiriman", "packing",
+        "paket", "sesuai", "mantap", "bagus", "cepat", "puas", "rusak",
+        "kecewa", "ori", "original", "aman", "rapi", "recommended"
+    }
+    if any(term in tokens for term in review_terms):
+        return True
+
+    return any(phrase in lower for phrase in POSITIVE_PHRASES) or any(phrase in lower for phrase in NEGATIVE_PHRASES)
+
+async def extract_review_text_from_element(element) -> str:
+    """Ambil teks ulasan dari elemen/card dan buang metadata halaman."""
+    candidates = []
+    seen = set()
+
+    async def add_candidate(raw_text: str):
+        for segment in str(raw_text or "").splitlines():
+            clean_segment = sanitize_text(segment)
+            if not clean_segment:
+                continue
+            content_hash = compute_content_hash(clean_segment)
+            if content_hash in seen:
+                continue
+            seen.add(content_hash)
+            if is_probably_review_text(clean_segment):
+                candidates.append(clean_segment)
+
+    try:
+        await add_candidate(await element.inner_text())
+    except:
+        pass
+
+    child_selectors = [
+        'span[data-testid="lblItemUlasan"]',
+        '[data-testid*="lblItemUlasan"]',
+        '[data-testid*="reviewContent"]',
+        '[data-testid*="review-content"]',
+        '[class*="review"]',
+        '[class*="Review"]',
+        '[class*="ulasan"]',
+        'p',
+        'span',
+    ]
+
+    for selector in child_selectors:
+        try:
+            children = await element.query_selector_all(selector)
+            for child in children:
+                await add_candidate(await child.inner_text())
+        except:
+            continue
+
+    if not candidates:
+        return ""
+
+    return max(candidates, key=score_review_candidate)
+
+async def extract_rating_from_element(element) -> int:
+    """Ambil rating jika ada. Return 0 saat tidak ditemukan agar tidak bias."""
+    rating_selectors = [
+        '[aria-label*="bintang"]',
+        '[aria-label*="Bintang"]',
+        '[aria-label*="star"]',
+        '[aria-label*="Star"]',
+        '[class*="rating"]',
+        '[class*="Rating"]',
+        '[data-testid*="rating"]',
+        '[data-testid*="Rating"]',
+    ]
+
+    for selector in rating_selectors:
+        try:
+            elements = await element.query_selector_all(selector)
+            for rating_elem in elements:
+                for attribute in ["aria-label", "title", "alt"]:
+                    value = await rating_elem.get_attribute(attribute)
+                    rating = extract_rating(value or "")
+                    if rating:
+                        return rating
+
+                rating_text = await rating_elem.inner_text()
+                rating = extract_rating(rating_text)
+                if rating:
+                    return rating
+        except:
+            continue
+
+    return 0
+
+async def open_review_section(page) -> bool:
+    """Coba buka tab/modal/section ulasan sebelum ekstraksi."""
+    clicked_any = False
+    click_result = None
+
+    try:
+        click_result = await page.evaluate("""
+            () => {
+                const include = ['lihat semua ulasan', 'semua ulasan', 'ulasan pembeli', 'ulasan'];
+                const exclude = ['tulis ulasan', 'beri ulasan', 'diskusi'];
+                const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.visibility !== 'hidden' && style.display !== 'none' &&
+                        rect.width > 0 && rect.height > 0;
+                };
+                const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], div, span'));
+                for (const node of nodes) {
+                    const text = (node.innerText || node.textContent || '').trim().toLowerCase();
+                    if (!text || text.length > 120 || !visible(node)) continue;
+                    if (!include.some(keyword => text.includes(keyword))) continue;
+                    if (exclude.some(keyword => text.includes(keyword))) continue;
+
+                    const clickable = node.closest('button, a, [role="button"]') || node;
+                    clickable.scrollIntoView({block: 'center', inline: 'center'});
+                    clickable.click();
+                    return text.slice(0, 100);
+                }
+                return null;
+            }
+        """)
+    except Exception as e:
+        logger.debug(f"Review section click evaluation failed: {str(e)[:80]}")
+
+    if click_result:
+        logger.info(f"Opened review section via text: {click_result}")
+        clicked_any = True
+        await asyncio.sleep(2)
+
+    # Scroll menuju heading ulasan jika ada.
+    try:
+        found_heading = await page.evaluate("""
+            () => {
+                const nodes = Array.from(document.querySelectorAll('h1,h2,h3,h4,section,div,span'));
+                const target = nodes.find(node => {
+                    const text = (node.innerText || node.textContent || '').trim().toLowerCase();
+                    return text && text.length < 80 && (text.includes('ulasan') || text.includes('review'));
+                });
+                if (target) {
+                    target.scrollIntoView({block: 'center', inline: 'center'});
+                    return (target.innerText || target.textContent || '').trim().slice(0, 80);
+                }
+                return null;
+            }
+        """)
+        if found_heading:
+            logger.info(f"Scrolled to possible review section: {found_heading}")
+            await asyncio.sleep(1)
+    except Exception as e:
+        logger.debug(f"Review section scroll failed: {str(e)[:80]}")
+
+    # Trigger lazy rendering di area ulasan.
+    for _ in range(5):
+        await page.mouse.wheel(0, 700)
+        await asyncio.sleep(random.uniform(0.5, 1.0))
+
+    return clicked_any
+
+async def trigger_review_lazy_load(page):
+    """Fokuskan ulang viewport ke area ulasan agar skeleton/card review ikut dimuat."""
+    try:
+        await page.evaluate("""
+            () => {
+                const nodes = Array.from(document.querySelectorAll('h1,h2,h3,h4,section,div,span'));
+                const target = nodes.find(node => {
+                    const text = (node.innerText || node.textContent || '').trim().toLowerCase();
+                    return text && text.length < 100 &&
+                        (text.includes('ulasan pembeli') || text === 'ulasan' || text.includes('review'));
+                });
+                if (target) {
+                    target.scrollIntoView({block: 'center', inline: 'center'});
+                }
+            }
+        """)
+    except Exception:
+        pass
+
+    for delta in (500, -160, 700):
+        try:
+            await page.mouse.wheel(0, delta)
+            await asyncio.sleep(0.5)
+        except Exception:
+            break
+
+async def extract_review_text_candidates_from_page(page, max_candidates: int = 200) -> List[str]:
+    """Fallback: ambil kandidat ulasan dari teks terlihat di halaman."""
+    try:
+        raw_candidates = await page.evaluate("""
+            () => {
+                const selectors = [
+                    '[data-testid*="ulasan"]',
+                    '[data-testid*="review"]',
+                    '[class*="review"]',
+                    '[class*="Review"]',
+                    '[class*="ulasan"]',
+                    'article',
+                    'p',
+                    'span',
+                    'div'
+                ];
+                const values = [];
+                const seen = new Set();
+                for (const selector of selectors) {
+                    for (const node of Array.from(document.querySelectorAll(selector))) {
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        if (!style || style.visibility === 'hidden' || style.display === 'none') continue;
+                        if (rect.width <= 0 || rect.height <= 0) continue;
+
+                        const text = (node.innerText || node.textContent || '').trim();
+                        if (!text || text.length < 5 || text.length > 700) continue;
+
+                        for (const part of text.split(/\\n+/)) {
+                            const clean = part.replace(/\\s+/g, ' ').trim();
+                            if (clean.length < 5 || clean.length > 500) continue;
+                            const key = clean.toLowerCase();
+                            if (seen.has(key)) continue;
+                            seen.add(key);
+                            values.push(clean);
+                        }
+                    }
+                }
+                return values.slice(0, 500);
+            }
+        """)
+    except Exception as e:
+        logger.debug(f"Page text fallback extraction failed: {str(e)[:80]}")
+        return []
+
+    unique_candidates = {}
+    for raw_text in raw_candidates:
+        clean_text = sanitize_text(raw_text)
+        if is_strong_review_candidate(clean_text):
+            unique_candidates[compute_content_hash(clean_text)] = clean_text
+
+    candidates = sorted(unique_candidates.values(), key=score_review_candidate, reverse=True)
+    return candidates[:max_candidates]
+
+async def get_review_loading_state(page) -> Dict:
+    """Ambil status loading section ulasan untuk menghindari ekstraksi terlalu cepat."""
+    try:
+        return await page.evaluate("""
+            () => {
+                const text = document.body ? document.body.innerText : '';
+                const lower = text.toLowerCase();
+                const skeletonSelectors = [
+                    '[class*="skeleton"]',
+                    '[class*="Skeleton"]',
+                    '[aria-busy="true"]',
+                    '[data-testid*="skeleton"]',
+                    '[data-testid*="loading"]'
+                ];
+                let skeletonCount = 0;
+                for (const selector of skeletonSelectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        if (style && style.display !== 'none' && style.visibility !== 'hidden' &&
+                            rect.width > 0 && rect.height > 0) {
+                            skeletonCount += 1;
+                        }
+                    }
+                }
+                return {
+                    textLength: text.length,
+                    hasReviewSummary: lower.includes('ulasan pembeli') || lower.includes('rating') || lower.includes('ulasan'),
+                    hasNoReviewText: lower.includes('belum ada ulasan'),
+                    skeletonCount
+                };
+            }
+        """)
+    except Exception:
+        return {"textLength": 0, "hasReviewSummary": False, "hasNoReviewText": False, "skeletonCount": 0}
+
+async def wait_for_review_content(page, network_review_candidates: Dict, timeout_seconds: int) -> bool:
+    """Tunggu sampai ulasan selesai loading atau kandidat ulasan/API muncul."""
+    logger.info(f"Waiting for review content up to {timeout_seconds}s...")
+    deadline = time.time() + timeout_seconds
+    last_log_second = 0
+    last_trigger_second = 0
+    reload_attempted = False
+
+    while time.time() < deadline:
+        if network_review_candidates:
+            logger.info(f"Review API data detected: {len(network_review_candidates)} candidates")
+            return True
+
+        candidates = await extract_review_text_candidates_from_page(page, max_candidates=5)
+        if candidates:
+            logger.info(f"Visible review text detected: {len(candidates)} candidates")
+            return True
+
+        state = await get_review_loading_state(page)
+        elapsed = int(timeout_seconds - (deadline - time.time()))
+
+        if elapsed - last_trigger_second >= 12:
+            await trigger_review_lazy_load(page)
+            last_trigger_second = elapsed
+
+        if (
+            not reload_attempted
+            and elapsed >= 35
+            and state.get("skeletonCount", 0) > 0
+            and not network_review_candidates
+        ):
+            reload_attempted = True
+            logger.warning("Review cards masih loading. Reload halaman sekali lalu coba buka area ulasan lagi...")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT)
+                await asyncio.sleep(5)
+                await open_review_section(page)
+            except Exception as e:
+                logger.debug(f"Review reload attempt failed: {str(e)[:80]}")
+
+        if elapsed - last_log_second >= 10:
+            logger.info(
+                f"Still waiting for reviews... skeleton={state.get('skeletonCount', 0)}, "
+                f"text={state.get('textLength', 0)} chars"
+            )
+            last_log_second = elapsed
+
+        await page.mouse.wheel(0, 500)
+        await asyncio.sleep(2)
+
+    state = await get_review_loading_state(page)
+    logger.warning(
+        f"Review content timeout. skeleton={state.get('skeletonCount', 0)}, "
+        f"text={state.get('textLength', 0)} chars"
+    )
+    return False
+
+async def save_debug_snapshot(page, reason: str):
+    """Simpan snapshot debug saat scraper tidak menemukan ulasan."""
+    safe_reason = re.sub(r'[^a-z0-9_]+', '_', reason.lower()).strip('_') or 'debug'
+    try:
+        await page.screenshot(path=f"debug_{safe_reason}.png", full_page=True)
+    except Exception:
+        pass
+    try:
+        with open(f"debug_{safe_reason}.html", "w", encoding="utf-8") as f:
+            f.write(await page.content())
+    except Exception:
+        pass
+    try:
+        text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        with open(f"debug_{safe_reason}.txt", "w", encoding="utf-8") as f:
+            f.write(text or "")
+    except Exception:
+        pass
+
+def extract_review_candidates_from_json(data) -> List[Tuple[str, int]]:
+    """Ambil kandidat ulasan dari response JSON/API secara generik."""
+    text_keys = {
+        "review", "reviewtext", "review_text", "content", "comment",
+        "message", "text", "description", "ulasan", "feedback"
+    }
+    rating_keys = {"rating", "rate", "score", "star", "stars"}
+    results = []
+
+    def walk(node, inherited_rating: int = 0):
+        if isinstance(node, dict):
+            local_rating = inherited_rating
+            text_values = []
+
+            for key, value in node.items():
+                key_norm = re.sub(r'[^a-z]', '', str(key).lower())
+
+                if key_norm in rating_keys:
+                    local_rating = extract_rating(str(value))
+
+                if isinstance(value, str):
+                    clean_value = sanitize_text(value)
+                    if key_norm in text_keys or is_strong_review_candidate(clean_value):
+                        if is_strong_review_candidate(clean_value):
+                            text_values.append(clean_value)
+
+            for text_value in text_values:
+                results.append((text_value, local_rating))
+
+            for value in node.values():
+                walk(value, local_rating)
+
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, inherited_rating)
+
+    walk(data)
+
+    unique = {}
+    for text, rating in results:
+        unique[compute_content_hash(text)] = (text, rating)
+
+    return list(unique.values())
+
+# ==========================================
+# 2. CACHE MANAGEMENT
+# ==========================================
+def get_cache_file(url: str) -> Path:
+    """Generate cache filename dari URL."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    return CACHE_DIR / f"cache_{url_hash}.json"
+
+def is_cache_valid(cache_file: Path) -> bool:
+    """Check if cache file masih valid (tidak expired)."""
+    if not cache_file.exists():
+        return False
+    
+    file_age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+    return file_age < timedelta(hours=CACHE_EXPIRY_HOURS)
+
+def load_from_cache(url: str) -> Optional[List[Dict]]:
+    """Load reviews dari cache jika tersedia dan valid."""
+    cache_file = get_cache_file(url)
+    
+    if is_cache_valid(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                logger.info(f"✓ Loaded {len(data)} reviews dari cache")
+                valid_data = [item for item in data if validate_review(item)[0]]
+                if not valid_data:
+                    logger.info("Cache ignored because it contains no valid review text")
+                    return None
+                if len(valid_data) != len(data):
+                    logger.info(f"Cache filtered: {len(valid_data)}/{len(data)} valid reviews")
+                return valid_data
+        except Exception as e:
+            logger.warning(f"Cache loading error: {e}")
+    
+    return None
+
+def save_to_cache(url: str, data: List[Dict]):
+    """Save reviews ke cache."""
+    cache_file = get_cache_file(url)
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Cache saved: {cache_file}")
+    except Exception as e:
+        logger.warning(f"Cache save error: {e}")
+
+# ==========================================
+# 3. INTELLIGENT SCROLL DETECTION
+# ==========================================
+async def detect_lazy_loading(page) -> bool:
+    """Detect if page memiliki lazy loading mechanism."""
+    try:
+        # Check untuk intersection observer, scroll event listeners, atau data-attributes
+        lazy_indicators = await page.evaluate("""
+            () => {
+                // Check untuk common lazy-load patterns
+                const hasIntersectionObserver = 'IntersectionObserver' in window;
+                const hasLazyElements = document.querySelectorAll('[data-lazy], [loading="lazy"]').length > 0;
+                const hasDynamicLoading = !!window.LazyLoadJS || !!window.LazyLoad;
+                
+                return {
+                    hasIntersectionObserver,
+                    hasLazyElements,
+                    hasDynamicLoading
+                };
+            }
+        """)
+        
+        has_lazy = any(lazy_indicators.values())
+        if has_lazy:
+            logger.info("✓ Detected lazy-loading mechanism")
+        return has_lazy
+    except:
+        return False
+
+async def wait_for_new_content(page, last_height: int, timeout_ms: int = 5000) -> Tuple[bool, int]:
+    """Wait untuk konten baru setelah scroll dengan intelligent timeout."""
+    try:
+        start_time = time.time()
+        while (time.time() - start_time) * 1000 < timeout_ms:
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height > last_height:
+                logger.info(f"✓ New content detected: {last_height} -> {new_height}px")
+                return True, new_height
+            await asyncio.sleep(0.2)
+        
+        return False, last_height
+    except:
+        return False, last_height
+
+# ==========================================
+# 4. ADVANCED SCRAPING WITH RETRY LOGIC
+# ==========================================
+async def scrape_reviews_advanced(
+    url: str,
+    max_reviews: int = 100,
+    use_cache: bool = True,
+    retry_count: int = 0,
+    headless: Optional[bool] = None
+) -> list:
+    """
+    Scrape reviews dengan smart scrolling, retry logic, dan caching.
+    
+    Features:
+    - Automatic cache checking untuk menghindari scrape ulang
+    - Intelligent lazy-load detection
+    - Adaptive retry logic dengan exponential backoff
+    - Better error recovery dan validation
+    - Rate limiting untuk respect server
+    """
+    
+    # Check cache terlebih dahulu
+    if use_cache:
+        cached_data = load_from_cache(url)
+        if cached_data:
+            return cached_data
+    
+    # Rate limiting
+    if retry_count > 0:
+        delay = config.RETRY_DELAY_BASE ** retry_count
+        logger.info(f"⏳ Rate limiting delay: {delay}s (retry {retry_count})")
+        await asyncio.sleep(min(delay, 30))  # Cap maksimal 30 detik
+    
+    reviews_data = []
+    reviews_hash_set = set()  # Untuk deduplicasi yang lebih akurat
+    
+    async with async_playwright() as p:
+        browser = None
+        try:
+            logger.info(f"🌐 Starting scraper untuk: {url[:60]}...")
+            
+            browser = await p.chromium.launch(
+                headless=config.HEADLESS if headless is None else headless
+            )
+            
+            context = await browser.new_context(
+                viewport={'width': 1366, 'height': 768},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            network_review_candidates = {}
+
+            async def collect_review_response(response):
+                try:
+                    url_lower = response.url.lower()
+                    if not any(keyword in url_lower for keyword in ["review", "ulasan", "graphql", "pdp"]):
+                        return
+
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "json" not in content_type and "graphql" not in url_lower:
+                        return
+
+                    data = await response.json()
+                    for text, rating in extract_review_candidates_from_json(data):
+                        network_review_candidates[compute_content_hash(text)] = (text, rating)
+                except Exception:
+                    return
+
+            page.on("response", lambda response: asyncio.create_task(collect_review_response(response)))
+
+            # Aktifkan stealth mode untuk bypass bot detection
+            stealth = Stealth()
+            await stealth.apply_stealth_async(context)
+            await stealth.apply_stealth_async(page)
+
+            logger.info(f"📄 Loading page...")
+            
+            # Page load dengan timeout adaptif
+            try:
+                await page.goto(url, wait_until="load", timeout=config.PAGE_LOAD_TIMEOUT)
+                logger.info("✓ Page loaded successfully")
+            except PlaywrightTimeoutError:
+                logger.warning("⚠️ Page load timeout, continuing with available content...")
+            except Exception as e:
+                logger.error(f"❌ Page load error: {e}")
+                if retry_count < config.MAX_RETRIES:
+                    logger.info(f"🔄 Retrying... ({retry_count + 1}/{config.MAX_RETRIES})")
+                    return await scrape_reviews_advanced(url, max_reviews, use_cache, retry_count + 1, headless)
+                raise
+            
+            # Wait untuk konten dirender
+            await asyncio.sleep(3)
+            
+            # Detect lazy loading
+            has_lazy = await detect_lazy_loading(page)
+            
+            # ===== INTELLIGENT INFINITE SCROLLING =====
+            logger.info("📜 Starting intelligent scroll...")
+            
+            last_height = await page.evaluate("document.body.scrollHeight")
+            scroll_count = 0
+            no_new_content_count = 0
+            max_scroll_iterations = config.SCROLL_ITERATIONS if has_lazy else 8
+            
+            while scroll_count < max_scroll_iterations and no_new_content_count < 3:
+                # Scroll ke bawah dengan smooth motion
+                await page.evaluate("window.scrollBy(0, 800)")
+                await asyncio.sleep(random.uniform(*config.SCROLL_PAUSE_TIME))
+                
+                # Check untuk konten baru
+                new_content_found, new_height = await wait_for_new_content(page, last_height)
+                
+                if not new_content_found:
+                    no_new_content_count += 1
+                    logger.info(f"⏸️  No new content ({no_new_content_count}/3)")
+                else:
+                    no_new_content_count = 0
+                
+                last_height = new_height
+                scroll_count += 1
+                logger.info(f"📊 Scroll {scroll_count}/{max_scroll_iterations}: {new_height}px")
+                
+                # Tunggu lazy loading dengan adaptive timing
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            
+            logger.info("✓ Scrolling complete")
+            await open_review_section(page)
+            review_content_ready = await wait_for_review_content(
+                page,
+                network_review_candidates,
+                config.REVIEW_LOAD_TIMEOUT
+            )
+            if not review_content_ready:
+                logger.warning(
+                    "Ulasan belum terbuka atau masih loading. Scraper akan mencoba fallback dan menyimpan debug jika tetap kosong."
+                )
+            logger.info("🔍 Starting review extraction...")
+
+            # ===== ENHANCED SELECTOR STRATEGY =====
+            review_selectors = [
+                # Tokopedia specific selectors
+                'span[data-testid*="lblItemUlasan"]',
+                'span[data-testid="lblItemUlasan"]',
+                '[data-testid*="reviewContent"]',
+                '[data-testid*="review-content"]',
+                '[data-testid*="Review"]',
+                '[data-testid*="ReviewCard"]',
+                '[data-testid*="cardReview"]',
+                '[data-testid*="ulasan"]',
+                '[data-testid*="review"]',
+                'div:has(span[data-testid*="lblItemUlasan"])',
+                'div:has(p[data-testid*="lblItemUlasan"])',
+                
+                # Generic review patterns
+                'p[class*="review"]',
+                'span[class*="review"]',
+                'div[class*="review"]',
+                'div[class*="Review"]',
+                'div[class*="feedback"]',
+                
+                # Indonesian e-commerce specific
+                'div[class*="UlasanPenjual"]',
+                'div[class*="ProductReview"]',
+                'div[class*="ulasan"]',
+                
+                # Fallback selectors
+                'div[role="article"]',
+                'article',
+                '.review-card',
+                '.feedback-item'
+            ]
+            
+            all_review_elements = []
+            successful_selectors = []
+            
+            for selector in review_selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    if len(elements) > 0:
+                        # Filter elemen yang tidak kosong
+                        valid_elements = []
+                        for elem in elements:
+                            try:
+                                text = await extract_review_text_from_element(elem)
+                                if text:
+                                    valid_elements.append(elem)
+                            except:
+                                continue
+                        
+                        if len(valid_elements) > 0:
+                            logger.info(f"✓ Selector '{selector}' found {len(valid_elements)} reviews")
+                            all_review_elements.extend(valid_elements)
+                            successful_selectors.append(selector)
+                except Exception as e:
+                    logger.debug(f"Selector '{selector}' failed: {str(e)[:50]}")
+                    continue
+            
+            logger.info(f"📊 Found {len(all_review_elements)} elements from {len(successful_selectors)} selectors")
+            
+            # ===== SMART DEDUPLICATION =====
+            unique_reviews = {}
+            for elem in all_review_elements:
+                try:
+                    text = await extract_review_text_from_element(elem)
+                    if text:
+                        content_hash = compute_content_hash(text)
+                        if content_hash not in unique_reviews:
+                            unique_reviews[content_hash] = elem
+                except:
+                    continue
+            
+            all_review_elements = list(unique_reviews.values())
+            logger.info(f"🔄 Deduplicated to {len(all_review_elements)} unique reviews")
+            
+            # ===== EXTRACT REVIEW DETAILS WITH VALIDATION =====
+            extracted_count = 0
+            skipped_count = 0
+            
+            for index, element in enumerate(all_review_elements):
+                if len(reviews_data) >= max_reviews:
+                    logger.info(f"✓ Reached max_reviews limit ({max_reviews})")
+                    break
+                
+                try:
+                    safe_text = await extract_review_text_from_element(element)
+                    rating = await extract_rating_from_element(element)
+                    sentiment = analyze_sentiment(safe_text)
+                    
+                    # Create review object
+                    review_obj = {
+                        "id": len(reviews_data) + 1,
+                        "review_text": safe_text,
+                        "rating": rating,
+                        "sentiment": sentiment,
+                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "text_length": len(safe_text),
+                        "source": "tokopedia"
+                    }
+                    
+                    # Validate review
+                    is_valid, validation_msg = validate_review(review_obj)
+                    
+                    if is_valid:
+                        # Check untuk duplicate berdasarkan content hash
+                        content_hash = compute_content_hash(safe_text)
+                        if content_hash not in reviews_hash_set:
+                            reviews_data.append(review_obj)
+                            reviews_hash_set.add(content_hash)
+                            extracted_count += 1
+                            
+                            if extracted_count % 10 == 0:
+                                logger.info(f"📥 Extracted {extracted_count} reviews...")
+                    else:
+                        skipped_count += 1
+                        logger.debug(f"Skipped review {index + 1}: {validation_msg}")
+                        
+                except Exception as e:
+                    logger.debug(f"Error extracting review {index + 1}: {str(e)[:60]}")
+                    continue
+            
+            logger.info(f"Selector extraction result: {extracted_count} valid, {skipped_count} skipped")
+            if not reviews_data:
+                await asyncio.sleep(1)
+
+            if not reviews_data and network_review_candidates:
+                logger.info(f"Trying network JSON fallback with {len(network_review_candidates)} candidates...")
+
+                for safe_text, rating in network_review_candidates.values():
+                    if len(reviews_data) >= max_reviews:
+                        break
+
+                    review_obj = {
+                        "id": len(reviews_data) + 1,
+                        "review_text": safe_text,
+                        "rating": rating,
+                        "sentiment": analyze_sentiment(safe_text),
+                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "text_length": len(safe_text),
+                        "source": "tokopedia"
+                    }
+
+                    is_valid, validation_msg = validate_review(review_obj)
+                    if not is_valid:
+                        skipped_count += 1
+                        logger.debug(f"Skipped network review: {validation_msg}")
+                        continue
+
+                    content_hash = compute_content_hash(safe_text)
+                    if content_hash in reviews_hash_set:
+                        continue
+
+                    reviews_data.append(review_obj)
+                    reviews_hash_set.add(content_hash)
+                    extracted_count += 1
+
+            if not reviews_data:
+                logger.info("No reviews found with selectors. Trying visible-text fallback...")
+                fallback_texts = await extract_review_text_candidates_from_page(page, max_reviews)
+                logger.info(f"Visible-text fallback found {len(fallback_texts)} candidates")
+
+                for safe_text in fallback_texts:
+                    if len(reviews_data) >= max_reviews:
+                        break
+
+                    review_obj = {
+                        "id": len(reviews_data) + 1,
+                        "review_text": safe_text,
+                        "rating": 0,
+                        "sentiment": analyze_sentiment(safe_text),
+                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "text_length": len(safe_text),
+                        "source": "tokopedia"
+                    }
+
+                    is_valid, validation_msg = validate_review(review_obj)
+                    if not is_valid:
+                        skipped_count += 1
+                        logger.debug(f"Skipped fallback review: {validation_msg}")
+                        continue
+
+                    content_hash = compute_content_hash(safe_text)
+                    if content_hash in reviews_hash_set:
+                        continue
+
+                    reviews_data.append(review_obj)
+                    reviews_hash_set.add(content_hash)
+                    extracted_count += 1
+
+            if not reviews_data:
+                logger.warning(
+                    "No valid reviews extracted. Halaman kemungkinan masih skeleton/loading atau respons review diblokir. "
+                    "Saving debug snapshot: debug_no_reviews_found.*"
+                )
+                await save_debug_snapshot(page, "no_reviews_found")
+
+            logger.info(f"Final extraction result: {extracted_count} valid, {skipped_count} skipped")
+
+        except Exception as e:
+            logger.error(f"❌ Scraper error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Retry logic untuk network errors
+            if retry_count < config.MAX_RETRIES:
+                logger.info(f"🔄 Retrying due to error... ({retry_count + 1}/{config.MAX_RETRIES})")
+                return await scrape_reviews_advanced(url, max_reviews, use_cache, retry_count + 1, headless)
+            raise
+        
+        finally:
+            if browser:
+                await browser.close()
+            
+    # Save ke cache sebelum return
+    if reviews_data and use_cache:
+        save_to_cache(url, reviews_data)
+    
+    return reviews_data
+
+# ==========================================
+# 5. EXPORT DATA WITH STATISTICS
+# ==========================================
+def save_to_csv(data: list, filename: str) -> bool:
+    """Simpan data ke CSV dengan format yang rapi dan sorted."""
+    if not data:
+        logger.warning("❌ No data to save")
+        return False
+    
+    try:
+        df = pd.DataFrame(data)
+        df = df.sort_values('date_scraped', ascending=False)
+        df.to_csv(filename, index=False, encoding='utf-8')
+        logger.info(f"✓ CSV saved: {filename} ({len(df)} rows)")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error saving CSV: {e}")
+        return False
+
+def save_to_json(data: list, filename: str) -> bool:
+    """Simpan data ke JSON untuk dashboard dengan validation."""
+    if not data:
+        logger.warning("❌ No data to save")
+        return False
+    
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ JSON saved: {filename} ({len(data)} records)")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error saving JSON: {e}")
+        return False
+
+def print_statistics(data: List[Dict]):
+    """Print detailed statistics tentang scraped data."""
+    if not data:
+        logger.warning("No data to analyze")
+        return
+    
+    df = pd.DataFrame(data)
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("📊 SCRAPING STATISTICS")
+    logger.info("=" * 70)
+    logger.info(f"Total Reviews Extracted: {len(df)}")
+    logger.info(f"Date Range: {df['date_scraped'].min()} to {df['date_scraped'].max()}")
+    
+    if 'rating' in df.columns:
+        logger.info(f"\n⭐ Rating Distribution:")
+        logger.info(f"  Average: {df['rating'].mean():.2f}/5")
+        logger.info(f"  Median: {df['rating'].median():.1f}/5")
+        logger.info(f"  Std Dev: {df['rating'].std():.2f}")
+        logger.info(f"  Min: {df['rating'].min()} | Max: {df['rating'].max()}")
+        
+        rating_dist = df['rating'].value_counts().sort_index(ascending=False)
+        for rating, count in rating_dist.items():
+            percentage = (count / len(df)) * 100
+            logger.info(f"    {int(rating)} stars: {count:3d} ({percentage:5.1f}%)")
+    
+    if 'sentiment' in df.columns:
+        logger.info(f"\n💭 Sentiment Distribution:")
+        sentiment_dist = df['sentiment'].value_counts()
+        for sentiment, count in sentiment_dist.items():
+            percentage = (count / len(df)) * 100
+            logger.info(f"    {sentiment.capitalize():10s}: {count:3d} ({percentage:5.1f}%)")
+    
+    if 'text_length' in df.columns:
+        logger.info(f"\n📝 Text Length Statistics:")
+        logger.info(f"  Average: {df['text_length'].mean():.0f} characters")
+        logger.info(f"  Median: {df['text_length'].median():.0f} characters")
+        logger.info(f"  Min: {df['text_length'].min()} | Max: {df['text_length'].max()}")
+    
+    logger.info("=" * 70)
+
+# ==========================================
+# 6. CONCURRENT SCRAPING FOR MULTIPLE URLs
+# ==========================================
+async def scrape_multiple_urls(
+    urls: List[str],
+    max_reviews_per_url: int = 100,
+    use_cache: bool = True,
+    headless: Optional[bool] = None
+) -> Dict[str, List[Dict]]:
+    """Scrape multiple URLs secara concurrent dengan rate limiting."""
+    results = {}
+    semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TASKS)
+    
+    async def scrape_with_semaphore(url):
+        async with semaphore:
+            logger.info(f"\n🔗 Processing URL: {url[:50]}...")
+            try:
+                data = await scrape_reviews_advanced(
+                    url,
+                    max_reviews_per_url,
+                    use_cache=use_cache,
+                    headless=headless
+                )
+                results[url] = data
+                logger.info(f"✓ Completed: {len(data)} reviews")
+            except Exception as e:
+                logger.error(f"❌ Failed: {e}")
+                results[url] = []
+    
+    logger.info(f"🚀 Starting concurrent scraping for {len(urls)} URLs...")
+    await asyncio.gather(*[scrape_with_semaphore(url) for url in urls])
+    
+    return results
+
+# ==========================================
+# 7. MAIN EXECUTION
+# ==========================================
+def parse_args(args: Optional[List[str]] = None):
+    """Parse CLI arguments untuk menjalankan scraper tanpa hard-coded URL."""
+    parser = argparse.ArgumentParser(description="Scrape ulasan produk Tokopedia.")
+    parser.add_argument("--url", action="append", help="URL produk. Bisa dipakai berulang untuk multi-URL.")
+    parser.add_argument("--url-file", help="File teks berisi satu URL produk per baris.")
+    parser.add_argument("--max-reviews", type=int, default=100, help="Jumlah maksimum ulasan per URL.")
+    parser.add_argument("--output-csv", default="dataset_ulasan_tokopedia.csv", help="Path output CSV.")
+    parser.add_argument("--output-json", default="dataset_ulasan_tokopedia.json", help="Path output JSON.")
+    parser.add_argument("--no-cache", action="store_true", help="Paksa scrape baru tanpa cache.")
+    parser.add_argument("--headless", action="store_true", help="Jalankan Chromium tanpa UI.")
+    return parser.parse_args(args)
+
+def load_urls_from_args(args) -> List[str]:
+    urls = list(args.url or [])
+    if args.url_file:
+        try:
+            with open(args.url_file, "r", encoding="utf-8") as f:
+                urls.extend(line.strip() for line in f if line.strip() and not line.strip().startswith("#"))
+        except Exception as e:
+            logger.error(f"Failed reading URL file: {e}")
+
+    return urls or [DEFAULT_TARGET_URL]
+
+def flatten_results(results: Dict[str, List[Dict]]) -> List[Dict]:
+    merged = []
+    for url, reviews in results.items():
+        for review in reviews:
+            item = dict(review)
+            item["source_url"] = url
+            item["id"] = len(merged) + 1
+            merged.append(item)
+    return merged
+
+async def main(cli_args: Optional[List[str]] = None):
+    """Main scraper execution dengan error handling."""
+    args = parse_args(cli_args)
+    urls = load_urls_from_args(args)
+    use_cache = not args.no_cache
+    
+    # Print banner
+    banner = """
+    ╔════════════════════════════════════════════════════════════╗
+    ║   TOKOPEDIA ADVANCED REVIEW SCRAPER v3.0                  ║
+    ║                                                            ║
+    ║   ✨ Features:                                            ║
+    ║   • Smart Caching & Retry Logic                          ║
+    ║   • Intelligent Lazy-Load Detection                      ║
+    ║   • Enhanced Error Recovery                              ║
+    ║   • Data Validation & Deduplication                      ║
+    ║   • Rate Limiting & Concurrent Support                  ║
+    ║   • Structured Logging & Statistics                      ║
+    ║                                                            ║
+    ╚════════════════════════════════════════════════════════════╝
+    """
+    logger.info(banner)
+    
+    try:
+        logger.info("🌐 Starting single URL scrape...")
+        if len(urls) == 1:
+            extracted_data = await scrape_reviews_advanced(
+                url=urls[0],
+                max_reviews=args.max_reviews,
+                use_cache=use_cache,
+                headless=args.headless
+            )
+        else:
+            results = await scrape_multiple_urls(
+                urls,
+                max_reviews_per_url=args.max_reviews,
+                use_cache=use_cache,
+                headless=args.headless
+            )
+            extracted_data = flatten_results(results)
+        
+        if extracted_data:
+            # Save data
+            save_to_csv(extracted_data, args.output_csv)
+            save_to_json(extracted_data, args.output_json)
+            
+            # Print statistics
+            print_statistics(extracted_data)
+            
+            logger.info("✓ Processing complete!")
+        else:
+            logger.warning("⚠️ No reviews extracted")
+            
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
