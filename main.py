@@ -224,12 +224,76 @@ def view_statistics():
     """Display data statistics."""
     try:
         import pandas as pd
+
+        if not os.path.exists("dataset_ulasan_tokopedia.csv"):
+            print("\nNo data found. Run scraper first.")
+            return
+
+        df = pd.read_csv("dataset_ulasan_tokopedia.csv")
+        try:
+            from scraper_ecomm_advanced import enrich_reviews_with_nlp
+            df = pd.DataFrame(enrich_reviews_with_nlp(df.to_dict('records')))
+        except Exception:
+            pass
+
+        print("\nDATA STATISTICS")
+        print("=" * 50)
+        print(f"Total Reviews:          {len(df)}")
+        print(f"Average Rating:         {df['rating'].mean():.2f}/5.0")
+        print(f"Average Text Length:    {df['text_length'].mean():.0f} characters")
+        print("\nSentiment Distribution:")
+        for sentiment, count in df['sentiment'].value_counts().items():
+            percentage = (count / len(df)) * 100
+            print(f"  {sentiment.upper():12} {count:4d} reviews ({percentage:5.1f}%)")
+
+        print("\nRating Breakdown:")
+        for rating in sorted(df['rating'].unique()):
+            count = len(df[df['rating'] == rating])
+            percentage = (count / len(df)) * 100
+            print(f"  {int(rating)} stars: {count:4d} reviews ({percentage:5.1f}%)")
+
+        if {'nlp_tokens', 'nlp_no_stopwords', 'nlp_stems', 'vector_terms'}.issubset(df.columns):
+            def _count_sequence_items(series):
+                total = 0
+                for value in series:
+                    if isinstance(value, list):
+                        total += len(value)
+                    elif isinstance(value, str):
+                        total += len([item for item in value.strip("[]").split(",") if item.strip()])
+                return total
+
+            vector_terms = df.iloc[0]['vector_terms'] if len(df) else []
+            if isinstance(vector_terms, list):
+                vector_count = len(vector_terms)
+            else:
+                vector_count = len([item for item in str(vector_terms).strip("[]").split(",") if item.strip()])
+
+            print("\nNLP Pipeline:")
+            print(f"  Tokenization:        {_count_sequence_items(df['nlp_tokens'])} tokens")
+            print(f"  Stopword Removal:    {_count_sequence_items(df['nlp_no_stopwords'])} tokens")
+            print(f"  Stemming:            {_count_sequence_items(df['nlp_stems'])} stems")
+            print(f"  Vectorization:       {vector_count} corpus features")
+
+        print("=" * 50)
+        return
+
+    except Exception as e:
+        print(f"\nError: {e}")
+        return
+
+    try:
+        import pandas as pd
         
         if not os.path.exists("dataset_ulasan_tokopedia.csv"):
             print("\n⚠️  No data found! Run scraper first.")
             return
         
         df = pd.read_csv("dataset_ulasan_tokopedia.csv")
+        try:
+            from scraper_ecomm_advanced import enrich_reviews_with_nlp
+            df = pd.DataFrame(enrich_reviews_with_nlp(df.to_dict('records')))
+        except Exception:
+            pass
         
         print("\n📈 DATA STATISTICS")
         print("=" * 50)

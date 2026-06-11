@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+scraper_cache/
+debug_*.png
+debug_*.html
+debug_*.txt
+debug_page.html
+
+nlp_env/
+.venv/
+venv/
+env/
+
+*.log
+*.tmp

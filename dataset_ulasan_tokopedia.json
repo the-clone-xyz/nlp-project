@@ -1,19 +1,46 @@
 [
   {
     "id": 1,
-    "review_text": "Ada masalah dengan produk ini?",
+    "review_text": "-Untuk 1kg bisa untuk 5pcs, boleh pilih beberapa motif untuk mempermurah pengiriman--",
     "rating": 0,
     "sentiment": "neutral",
-    "date_scraped": "2026-05-18 21:58:31",
-    "text_length": 30,
+    "date_scraped": "2026-05-22 11:37:34",
+    "text_length": 85,
     "source": "tokopedia"
   },
   {
     "id": 2,
+    "review_text": "Semua produk sudah REALPICT, kesamaan warna 95 karena pencahayaan saat pemotretan, t",
+    "rating": 0,
+    "sentiment": "neutral",
+    "date_scraped": "2026-05-22 11:37:34",
+    "text_length": 84,
+    "source": "tokopedia"
+  },
+  {
+    "id": 3,
+    "review_text": "Ada masalah dengan produk ini?",
+    "rating": 0,
+    "sentiment": "neutral",
+    "date_scraped": "2026-05-22 11:37:34",
+    "text_length": 30,
+    "source": "tokopedia"
+  },
+  {
+    "id": 4,
+    "review_text": "Tentang Produk Ini",
+    "rating": 0,
+    "sentiment": "neutral",
+    "date_scraped": "2026-05-22 11:37:34",
+    "text_length": 18,
+    "source": "tokopedia"
+  },
+  {
+    "id": 5,
     "review_text": "Detail Produk",
     "rating": 0,
     "sentiment": "neutral",
-    "date_scraped": "2026-05-18 21:58:31",
+    "date_scraped": "2026-05-22 11:37:34",
     "text_length": 13,
     "source": "tokopedia"
   }

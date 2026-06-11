@@ -3,11 +3,18 @@ from tkinter import ttk, messagebox, filedialog
 import pandas as pd
 import json
 import html
+import ast
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from datetime import datetime
+from collections import Counter
 import os
+
+try:
+    from scraper_ecomm_advanced import enrich_reviews_with_nlp
+except Exception:
+    enrich_reviews_with_nlp = None
 
 # Konfigurasi matplotlib untuk rendering modern (Flat Design)
 plt.rcParams['font.family'] = 'sans-serif'
@@ -229,10 +236,149 @@ class DashboardApp:
         self.rating_canvas_frame.pack(fill='both', expand=True)
 
     def create_text_tab(self):
-        container = ttk.Frame(self.text_frame, padding=10)
+        container = ttk.Frame(self.text_frame, padding=14)
         container.pack(fill='both', expand=True)
-        self.text_canvas_frame = ttk.Frame(container)
-        self.text_canvas_frame.pack(fill='both', expand=True)
+
+        stats_panel = ttk.Frame(container)
+        stats_panel.pack(fill='x', pady=(0, 14))
+
+        self.nlp_stats_labels = {}
+        nlp_stat_items = [
+            ("Tokenization", "token_count", self.PRIMARY_COLOR, "Total token mentah"),
+            ("Stopword Removal", "filtered_count", self.SUCCESS_COLOR, "Token siap proses"),
+            ("Stemming", "unique_stem_count", self.WARNING_COLOR, "Stem unik"),
+            ("Vectorization", "vector_feature_count", self.INFO_COLOR, "Fitur corpus"),
+        ]
+
+        for index, (label, key, color, caption) in enumerate(nlp_stat_items):
+            stats_panel.columnconfigure(index, weight=1)
+            card_border, card_inner = self.create_card(stats_panel)
+            card_border.grid(row=0, column=index, sticky='ew', padx=(0 if index == 0 else 8, 0))
+
+            tk.Frame(card_inner, bg=color, height=3).pack(fill='x')
+            tk.Label(
+                card_inner,
+                text=label.upper(),
+                font=('Segoe UI', 9, 'bold'),
+                bg=self.CARD_BG,
+                fg=self.TEXT_MUTED
+            ).pack(anchor='w', padx=16, pady=(14, 2))
+            value_label = tk.Label(card_inner, text="0", font=('Segoe UI', 24, 'bold'), fg=color, bg=self.CARD_BG)
+            value_label.pack(anchor='w', padx=16)
+            tk.Label(
+                card_inner,
+                text=caption,
+                font=('Segoe UI', 9),
+                bg=self.CARD_BG,
+                fg=self.TEXT_MUTED
+            ).pack(anchor='w', padx=16, pady=(0, 14))
+            self.nlp_stats_labels[key] = value_label
+
+        content_frame = ttk.Frame(container)
+        content_frame.pack(fill='both', expand=True)
+        content_frame.columnconfigure(0, weight=5)
+        content_frame.columnconfigure(1, weight=7)
+        content_frame.rowconfigure(0, weight=1)
+
+        pipeline_border, pipeline_inner = self.create_card(content_frame)
+        pipeline_border.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+
+        pipeline_header = tk.Frame(pipeline_inner, bg=self.CARD_BG)
+        pipeline_header.pack(fill='x', padx=18, pady=(16, 8))
+        tk.Label(
+            pipeline_header,
+            text="Pipeline NLP",
+            font=('Segoe UI', 14, 'bold'),
+            bg=self.CARD_BG,
+            fg=self.TEXT_MAIN
+        ).pack(anchor='w')
+        self.nlp_review_preview_label = tk.Label(
+            pipeline_header,
+            text="-",
+            font=('Segoe UI', 9),
+            bg=self.CARD_BG,
+            fg=self.TEXT_MUTED,
+            justify='left',
+            anchor='w',
+            wraplength=520
+        )
+        self.nlp_review_preview_label.pack(anchor='w', fill='x', pady=(5, 0))
+
+        tk.Frame(pipeline_inner, bg=self.BORDER_COLOR, height=1).pack(fill='x', padx=18, pady=(4, 10))
+
+        stage_panel = tk.Frame(pipeline_inner, bg=self.CARD_BG)
+        stage_panel.pack(fill='both', expand=True, padx=18, pady=(0, 16))
+
+        self.nlp_stage_output_labels = {}
+        stage_items = [
+            ("1", "Tokenization", "tokens", self.PRIMARY_COLOR),
+            ("2", "Stopword Removal", "filtered", self.SUCCESS_COLOR),
+            ("3", "Stemming", "stems", self.WARNING_COLOR),
+            ("4", "Vectorization", "vector", self.INFO_COLOR),
+        ]
+
+        for index, (step_no, title, key, color) in enumerate(stage_items):
+            row = tk.Frame(stage_panel, bg=self.CARD_BG)
+            row.pack(fill='x', pady=(0, 10 if index < len(stage_items) - 1 else 0))
+
+            badge = tk.Label(
+                row,
+                text=step_no,
+                font=('Segoe UI', 10, 'bold'),
+                bg=color,
+                fg='white',
+                width=3,
+                padx=4,
+                pady=4
+            )
+            badge.pack(side='left', anchor='n', padx=(0, 12))
+
+            text_area = tk.Frame(row, bg=self.CARD_BG)
+            text_area.pack(side='left', fill='x', expand=True)
+
+            tk.Label(
+                text_area,
+                text=title,
+                font=('Segoe UI', 10, 'bold'),
+                bg=self.CARD_BG,
+                fg=self.TEXT_MAIN
+            ).pack(anchor='w')
+
+            output_label = tk.Label(
+                text_area,
+                text="-",
+                font=('Segoe UI', 9),
+                bg=self.CARD_BG,
+                fg=self.TEXT_MUTED,
+                justify='left',
+                anchor='w',
+                wraplength=540
+            )
+            output_label.pack(anchor='w', fill='x', pady=(3, 0))
+            self.nlp_stage_output_labels[key] = output_label
+
+        chart_border, chart_inner = self.create_card(content_frame)
+        chart_border.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
+
+        chart_header = tk.Frame(chart_inner, bg=self.CARD_BG)
+        chart_header.pack(fill='x', padx=18, pady=(16, 0))
+        tk.Label(
+            chart_header,
+            text="Top Fitur Teks",
+            font=('Segoe UI', 14, 'bold'),
+            bg=self.CARD_BG,
+            fg=self.TEXT_MAIN
+        ).pack(anchor='w')
+        tk.Label(
+            chart_header,
+            text="Frekuensi stem paling dominan di corpus",
+            font=('Segoe UI', 9),
+            bg=self.CARD_BG,
+            fg=self.TEXT_MUTED
+        ).pack(anchor='w', pady=(4, 0))
+
+        self.text_canvas_frame = tk.Frame(chart_inner, bg=self.CARD_BG)
+        self.text_canvas_frame.pack(fill='both', expand=True, padx=12, pady=12)
 
     def create_data_tab(self):
         container = ttk.Frame(self.data_frame, padding=15)
@@ -294,7 +440,126 @@ class DashboardApp:
         df.loc[~df['sentiment'].isin(['positive', 'negative', 'neutral']), 'sentiment'] = 'neutral'
         
         df['text_length'] = pd.to_numeric(df.get('text_length', df['review_text'].str.len()), errors='coerce').fillna(0).astype(int)
+        if enrich_reviews_with_nlp is not None:
+            try:
+                df = pd.DataFrame(enrich_reviews_with_nlp(df.to_dict('records')))
+            except Exception:
+                pass
+
+        nlp_defaults = {
+            'nlp_tokens': [],
+            'nlp_no_stopwords': [],
+            'nlp_stems': [],
+            'nlp_term_frequency': {},
+            'vector_terms': [],
+            'vector_values': [],
+        }
+        for column, default_value in nlp_defaults.items():
+            if column not in df.columns:
+                df[column] = [list(default_value) if isinstance(default_value, list) else dict(default_value) for _ in range(len(df))]
+
         return df
+
+    def parse_sequence_value(self, value):
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, tuple):
+            return [str(item) for item in value]
+        if value is None:
+            return []
+        if isinstance(value, float) and pd.isna(value):
+            return []
+
+        text = str(value).strip()
+        if not text or text.lower() in {'nan', 'none'}:
+            return []
+
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                parsed = loader(text)
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed]
+                if isinstance(parsed, tuple):
+                    return [str(item) for item in parsed]
+                if isinstance(parsed, dict):
+                    return [str(key) for key in parsed.keys()]
+            except Exception:
+                continue
+
+        return [part.strip() for part in text.split(',') if part.strip()]
+
+    def format_token_preview(self, tokens, limit=18):
+        tokens = [str(token) for token in tokens if str(token).strip()]
+        if not tokens:
+            return "-"
+
+        preview = tokens[:limit]
+        suffix = f" ... (+{len(tokens) - limit})" if len(tokens) > limit else ""
+        return ", ".join(preview) + suffix
+
+    def update_nlp_stats(self):
+        if self.df is None or not hasattr(self, 'nlp_stats_labels'):
+            return
+
+        all_tokens = []
+        all_filtered = []
+        all_stems = []
+        for _, row in self.df.iterrows():
+            all_tokens.extend(self.parse_sequence_value(row.get('nlp_tokens', [])))
+            all_filtered.extend(self.parse_sequence_value(row.get('nlp_no_stopwords', [])))
+            all_stems.extend(self.parse_sequence_value(row.get('nlp_stems', [])))
+
+        vector_terms = self.parse_sequence_value(self.df.iloc[0].get('vector_terms', [])) if len(self.df) else []
+        stats = {
+            'token_count': len(all_tokens),
+            'filtered_count': len(all_filtered),
+            'unique_stem_count': len(set(all_stems)),
+            'vector_feature_count': len(vector_terms),
+        }
+
+        for key, value in stats.items():
+            if key in self.nlp_stats_labels:
+                self.nlp_stats_labels[key].config(text=f"{value:,}")
+
+    def update_nlp_stage_table(self):
+        if not hasattr(self, 'nlp_stage_output_labels'):
+            return
+
+        if self.df is None or len(self.df) == 0:
+            for label in self.nlp_stage_output_labels.values():
+                label.config(text="-")
+            return
+
+        row = self.df.iloc[0]
+        review_text = str(row.get('review_text', '')).strip()
+        if hasattr(self, 'nlp_review_preview_label'):
+            preview = review_text[:180] + ("..." if len(review_text) > 180 else "")
+            self.nlp_review_preview_label.config(text=preview or "-")
+
+        tokens = self.parse_sequence_value(row.get('nlp_tokens', []))
+        filtered = self.parse_sequence_value(row.get('nlp_no_stopwords', []))
+        stems = self.parse_sequence_value(row.get('nlp_stems', []))
+        vector_terms = self.parse_sequence_value(row.get('vector_terms', []))
+        vector_values = self.parse_sequence_value(row.get('vector_values', []))
+
+        vector_pairs = []
+        for term, value in zip(vector_terms, vector_values):
+            try:
+                count = int(float(value))
+            except Exception:
+                count = 0
+            if count > 0:
+                vector_pairs.append(f"{term}:{count}")
+
+        outputs = {
+            "tokens": self.format_token_preview(tokens, limit=20),
+            "filtered": self.format_token_preview(filtered, limit=20),
+            "stems": self.format_token_preview(stems, limit=20),
+            "vector": self.format_token_preview(vector_pairs, limit=14),
+        }
+
+        for key, label in self.nlp_stage_output_labels.items():
+            label.config(text=outputs.get(key, "-"))
 
     def valid_rating_series(self):
         if self.df is None or 'rating' not in self.df.columns:
@@ -462,8 +727,69 @@ class DashboardApp:
         canvas.get_tk_widget().pack(fill='both', expand=True)
         
     def draw_text_chart(self):
-        # Menyederhanakan placeholder untuk efisiensi
-        self.show_readable_state(self.text_canvas_frame, "Gunakan tab Ringkasan", "Distribusi teks telah digabungkan ke tab utama untuk visibilitas yang lebih baik.")
+        self.update_nlp_stats()
+        self.update_nlp_stage_table()
+        self.clear_frame(self.text_canvas_frame)
+
+        term_counts = Counter()
+        for _, row in self.df.iterrows():
+            term_counts.update(self.parse_sequence_value(row.get('nlp_stems', [])))
+
+        top_terms = [(term, count) for term, count in term_counts.most_common(15) if term and count > 0]
+        if not top_terms:
+            self.show_readable_state(
+                self.text_canvas_frame,
+                "Data NLP Belum Tersedia",
+                "Pastikan kolom review_text berisi teks ulasan yang dapat diproses."
+            )
+            return
+
+        terms = [term for term, _ in reversed(top_terms)]
+        counts = [count for _, count in reversed(top_terms)]
+
+        fig = Figure(figsize=(10, 6), dpi=100, facecolor=self.CARD_BG)
+        ax = fig.add_subplot(1, 1, 1)
+        palette = [
+            self.PRIMARY_COLOR,
+            self.SUCCESS_COLOR,
+            self.WARNING_COLOR,
+            self.INFO_COLOR,
+            self.DANGER_COLOR,
+            '#7c3aed',
+            '#475569',
+        ]
+        colors = [palette[index % len(palette)] for index, _ in enumerate(terms)]
+        bars = ax.barh(terms, counts, color=colors, alpha=0.88, height=0.62)
+
+        ax.set_facecolor(self.CARD_BG)
+        ax.set_xlabel('Frekuensi', color=self.TEXT_MUTED, labelpad=10)
+        ax.tick_params(axis='x', colors=self.TEXT_MUTED, labelsize=9)
+        ax.tick_params(axis='y', colors=self.TEXT_MAIN, labelsize=9)
+        ax.grid(axis='x', color=self.BORDER_COLOR, linewidth=0.8)
+        ax.grid(axis='y', visible=False)
+
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(
+                width + max(counts) * 0.015,
+                bar.get_y() + bar.get_height() / 2,
+                f'{int(width)}',
+                va='center',
+                ha='left',
+                color=self.TEXT_MUTED,
+                fontsize=9,
+                fontweight='bold'
+            )
+
+        ax.set_xlim(0, max(counts) * 1.18 if counts else 1)
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.text_canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
 
     def update_data_table(self):
         for item in self.tree.get_children():

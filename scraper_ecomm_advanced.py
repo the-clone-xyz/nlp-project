@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import Stealth
@@ -134,10 +135,187 @@ REVIEW_NOISE_PATTERNS = [
     r'^\d+\s+ulasan\b',
 ]
 
+INDONESIAN_STOPWORDS = {
+    "ada", "adalah", "agar", "akan", "aku", "anda", "atau", "bagaimana",
+    "bagi", "bahwa", "banyak", "baru", "begini", "begitu", "belum", "bisa",
+    "buat", "dalam", "dan", "dapat", "dari", "daripada", "dengan", "di",
+    "dia", "ini", "itu", "jadi", "jangan", "jika", "juga", "karena",
+    "kami", "kamu", "kan", "ke", "kembali", "kemudian", "kepada", "kita",
+    "lagi", "lah", "lain", "lalu", "lebih", "maka", "masih", "mereka",
+    "nya", "oleh", "pada", "paling", "para", "per", "saat", "saja",
+    "saling", "sama", "sangat", "saya", "sebagai", "sebelum", "sebuah",
+    "sedang", "sehingga", "sekali", "semua", "sendiri", "seperti", "serta",
+    "si", "sudah", "supaya", "tapi", "telah", "tentang", "tersebut",
+    "tetapi", "tidak", "untuk", "yang", "ya", "yaitu", "yakni",
+    "aja", "banget", "dong", "nih", "sih", "kok", "deh"
+}
+
+IRREGULAR_STEMS = {
+    "barangnya": "barang",
+    "produknya": "produk",
+    "paketnya": "paket",
+    "packingnya": "packing",
+    "sellernya": "seller",
+    "tokonya": "toko",
+    "pengiriman": "kirim",
+    "dikirim": "kirim",
+    "terkirim": "kirim",
+    "mengirim": "kirim",
+    "kiriman": "kirim",
+    "berfungsi": "fungsi",
+    "memuaskan": "puas",
+    "mengecewakan": "kecewa",
+    "digunakan": "guna",
+    "menggunakan": "guna",
+    "pemakaian": "pakai",
+    "sesuai": "sesuai",
+}
+
+NLP_VECTOR_MAX_FEATURES = 25
+NLP_VECTOR_PREFIX = "vec_"
+
 def tokenize_text(text: str) -> List[str]:
     """Tokenisasi ringan untuk ulasan Bahasa Indonesia."""
     tokens = re.findall(r'[a-z0-9]+', text.lower())
     return [re.sub(r'(.)\1{2,}', r'\1\1', token) for token in tokens]
+
+def remove_stopwords(tokens: List[str]) -> List[str]:
+    """Hapus stopword umum agar kata bermakna lebih dominan."""
+    return [
+        token for token in tokens
+        if (token not in INDONESIAN_STOPWORDS or token in NEGATIONS) and len(token) > 1
+    ]
+
+def stem_indonesian_word(word: str) -> str:
+    """Stemmer ringan Bahasa Indonesia tanpa dependency eksternal."""
+    token = str(word or "").lower().strip()
+    if len(token) <= 3:
+        return token
+
+    if token in IRREGULAR_STEMS:
+        return IRREGULAR_STEMS[token]
+
+    for suffix in ("lah", "kah", "tah", "pun"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            token = token[:-len(suffix)]
+            break
+
+    for suffix in ("ku", "mu", "nya"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            token = token[:-len(suffix)]
+            break
+
+    if token in IRREGULAR_STEMS:
+        return IRREGULAR_STEMS[token]
+
+    prefix_rules = [
+        ("meny", "s"), ("peny", "s"),
+        ("meng", ""), ("peng", ""),
+        ("mem", ""), ("pem", ""),
+        ("men", ""), ("pen", ""),
+        ("ber", ""), ("ter", ""),
+        ("per", ""), ("di", ""),
+        ("ke", ""), ("se", ""),
+        ("me", ""), ("pe", ""),
+    ]
+    for prefix, replacement in prefix_rules:
+        if token.startswith(prefix) and len(token) - len(prefix) >= 4:
+            token = replacement + token[len(prefix):]
+            break
+
+    for suffix in ("kan", "an", "i"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            token = token[:-len(suffix)]
+            break
+
+    return IRREGULAR_STEMS.get(token, token)
+
+def stem_tokens(tokens: List[str]) -> List[str]:
+    """Ubah token hasil stopword removal menjadi bentuk dasar sederhana."""
+    return [stem_indonesian_word(token) for token in tokens if token]
+
+def build_nlp_features(text: str) -> Dict:
+    """Bangun tahapan NLP per ulasan: tokenization, stopword removal, stemming."""
+    tokens = tokenize_text(sanitize_text(text))
+    tokens_no_stopwords = remove_stopwords(tokens)
+    stemmed_tokens = stem_tokens(tokens_no_stopwords)
+    term_frequency = dict(Counter(stemmed_tokens))
+
+    return {
+        "nlp_tokens": tokens,
+        "nlp_no_stopwords": tokens_no_stopwords,
+        "nlp_stems": stemmed_tokens,
+        "nlp_term_frequency": term_frequency,
+    }
+
+def _vector_column_name(term: str, used_columns: set) -> str:
+    base = re.sub(r'[^a-z0-9]+', '_', str(term).lower()).strip('_') or "term"
+    column = f"{NLP_VECTOR_PREFIX}{base}"
+    if column not in used_columns:
+        used_columns.add(column)
+        return column
+
+    counter = 2
+    while f"{column}_{counter}" in used_columns:
+        counter += 1
+    column = f"{column}_{counter}"
+    used_columns.add(column)
+    return column
+
+def enrich_reviews_with_nlp(data: List[Dict], max_features: int = NLP_VECTOR_MAX_FEATURES) -> List[Dict]:
+    """Tambahkan fitur NLP dan vectorization ke semua review dalam satu corpus."""
+    if not data:
+        return data
+
+    corpus_counts = Counter()
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+
+        for key in list(review.keys()):
+            if str(key).startswith(NLP_VECTOR_PREFIX):
+                del review[key]
+
+        features = build_nlp_features(review.get("review_text", ""))
+        review.update(features)
+        corpus_counts.update(features["nlp_stems"])
+
+    vocabulary = [
+        term for term, _ in corpus_counts.most_common(max_features)
+        if term and not term.isdigit()
+    ]
+
+    used_columns = set()
+    vector_columns = [_vector_column_name(term, used_columns) for term in vocabulary]
+
+    for review in data:
+        if not isinstance(review, dict):
+            continue
+
+        term_counts = Counter(review.get("nlp_stems", []))
+        vector_values = [int(term_counts.get(term, 0)) for term in vocabulary]
+        review["vector_terms"] = vocabulary
+        review["vector_values"] = vector_values
+
+        for column, value in zip(vector_columns, vector_values):
+            review[column] = value
+
+    return data
+
+def create_review_record(review_id: int, text: str, rating: int) -> Dict:
+    """Buat object review lengkap dengan fitur NLP."""
+    safe_text = sanitize_text(text)
+    review_obj = {
+        "id": review_id,
+        "review_text": safe_text,
+        "rating": rating,
+        "sentiment": analyze_sentiment(safe_text),
+        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "text_length": len(safe_text),
+        "source": "tokopedia"
+    }
+    review_obj.update(build_nlp_features(safe_text))
+    return review_obj
 
 def is_probably_review_text(text: str) -> bool:
     """Filter agar teks ringkasan/rating halaman tidak masuk sebagai ulasan."""
@@ -712,7 +890,7 @@ def load_from_cache(url: str) -> Optional[List[Dict]]:
                     return None
                 if len(valid_data) != len(data):
                     logger.info(f"Cache filtered: {len(valid_data)}/{len(data)} valid reviews")
-                return valid_data
+                return enrich_reviews_with_nlp(valid_data)
         except Exception as e:
             logger.warning(f"Cache loading error: {e}")
     
@@ -998,18 +1176,11 @@ async def scrape_reviews_advanced(
                 try:
                     safe_text = await extract_review_text_from_element(element)
                     rating = await extract_rating_from_element(element)
-                    sentiment = analyze_sentiment(safe_text)
-                    
-                    # Create review object
-                    review_obj = {
-                        "id": len(reviews_data) + 1,
-                        "review_text": safe_text,
-                        "rating": rating,
-                        "sentiment": sentiment,
-                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "text_length": len(safe_text),
-                        "source": "tokopedia"
-                    }
+                    review_obj = create_review_record(
+                        len(reviews_data) + 1,
+                        safe_text,
+                        rating
+                    )
                     
                     # Validate review
                     is_valid, validation_msg = validate_review(review_obj)
@@ -1043,15 +1214,11 @@ async def scrape_reviews_advanced(
                     if len(reviews_data) >= max_reviews:
                         break
 
-                    review_obj = {
-                        "id": len(reviews_data) + 1,
-                        "review_text": safe_text,
-                        "rating": rating,
-                        "sentiment": analyze_sentiment(safe_text),
-                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "text_length": len(safe_text),
-                        "source": "tokopedia"
-                    }
+                    review_obj = create_review_record(
+                        len(reviews_data) + 1,
+                        safe_text,
+                        rating
+                    )
 
                     is_valid, validation_msg = validate_review(review_obj)
                     if not is_valid:
@@ -1076,15 +1243,11 @@ async def scrape_reviews_advanced(
                     if len(reviews_data) >= max_reviews:
                         break
 
-                    review_obj = {
-                        "id": len(reviews_data) + 1,
-                        "review_text": safe_text,
-                        "rating": 0,
-                        "sentiment": analyze_sentiment(safe_text),
-                        "date_scraped": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "text_length": len(safe_text),
-                        "source": "tokopedia"
-                    }
+                    review_obj = create_review_record(
+                        len(reviews_data) + 1,
+                        safe_text,
+                        0
+                    )
 
                     is_valid, validation_msg = validate_review(review_obj)
                     if not is_valid:
@@ -1124,6 +1287,8 @@ async def scrape_reviews_advanced(
             if browser:
                 await browser.close()
             
+    reviews_data = enrich_reviews_with_nlp(reviews_data)
+
     # Save ke cache sebelum return
     if reviews_data and use_cache:
         save_to_cache(url, reviews_data)
@@ -1140,6 +1305,7 @@ def save_to_csv(data: list, filename: str) -> bool:
         return False
     
     try:
+        data = enrich_reviews_with_nlp(data)
         df = pd.DataFrame(data)
         df = df.sort_values('date_scraped', ascending=False)
         df.to_csv(filename, index=False, encoding='utf-8')
@@ -1156,6 +1322,7 @@ def save_to_json(data: list, filename: str) -> bool:
         return False
     
     try:
+        data = enrich_reviews_with_nlp(data)
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.info(f"✓ JSON saved: {filename} ({len(data)} records)")
