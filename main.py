@@ -25,6 +25,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+
+def can_launch_headed_browser() -> bool:
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
 def print_banner():
     """Print application banner."""
     banner = """
@@ -123,8 +129,13 @@ def prompt_scraper_options():
     cache_raw = input("Gunakan cache jika tersedia? (y/n) [n]: ").strip().lower()
     use_cache = cache_raw == "y"
 
-    headless_raw = input("Jalankan browser tanpa tampilan/headless? (y/n) [n]: ").strip().lower()
-    headless = headless_raw == "y"
+    default_headless = not can_launch_headed_browser()
+    default_label = "y" if default_headless else "n"
+    headless_raw = input(f"Jalankan browser tanpa tampilan/headless? (y/n) [{default_label}]: ").strip().lower()
+    headless = default_headless if not headless_raw else headless_raw == "y"
+    if not headless and not can_launch_headed_browser():
+        print("\nBrowser visual tidak tersedia karena XServer/DISPLAY tidak ada. Menggunakan mode headless.")
+        headless = True
 
     return {
         "url": url,

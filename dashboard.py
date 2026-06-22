@@ -4,6 +4,8 @@ import pandas as pd
 import json
 import html
 import ast
+import asyncio
+import threading
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -12,9 +14,17 @@ from collections import Counter
 import os
 
 try:
-    from scraper_ecomm_advanced import enrich_reviews_with_nlp
+    from scraper_ecomm_advanced import (
+        enrich_reviews_with_nlp,
+        scrape_reviews_advanced,
+        save_to_csv,
+        save_to_json,
+    )
 except Exception:
     enrich_reviews_with_nlp = None
+    scrape_reviews_advanced = None
+    save_to_csv = None
+    save_to_json = None
 
 # Konfigurasi matplotlib untuk rendering modern (Flat Design)
 plt.rcParams['font.family'] = 'sans-serif'
@@ -53,6 +63,13 @@ class DashboardApp:
         
         self.data = None
         self.df = None
+        self.scrape_thread = None
+        self.scrape_url_var = tk.StringVar()
+        self.scrape_limit_var = tk.StringVar(value="100")
+        self.scrape_cache_var = tk.BooleanVar(value=False)
+        self.scrape_browser_var = tk.BooleanVar(value=True)
+        self.scrape_last_url = ""
+        self.dashboard_address_var = tk.StringVar(value="tokopedia://dashboard/ringkasan")
         
         # Inisialisasi Tema
         self.style = ttk.Style()
@@ -112,30 +129,69 @@ class DashboardApp:
         plt.close('all')  # Sangat penting untuk maintainability & performa jangka panjang
 
     def create_widgets(self):
-        # Header
-        header_frame = ttk.Frame(self.root)
-        header_frame.pack(fill='x', padx=20, pady=(20, 10))
-        
-        title_frame = ttk.Frame(header_frame)
-        title_frame.pack(side='left', expand=True, fill='x')
-        
-        ttk.Label(title_frame, text="Dashboard Analisis Ulasan Tokopedia", style='Title.TLabel').pack(anchor='w')
-        ttk.Label(title_frame, text="Monitor dan analisis kualitas data, sentimen, rating, dan pola teks ulasan.", 
-                  style='Subtitle.TLabel').pack(anchor='w', pady=(2, 0))
-        
-        # Toolbar Buttons
-        btn_frame = ttk.Frame(header_frame)
-        btn_frame.pack(side='right')
-        
-        ttk.Button(btn_frame, text="Muat CSV", command=self.load_csv_file, style='Primary.TButton').pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="Segarkan", command=self.refresh_dashboard, style='Primary.TButton').pack(side='left', padx=5)
-        ttk.Button(btn_frame, text="Ekspor HTML", command=self.export_report, style='Primary.TButton').pack(side='left', padx=5)
-        
-        # Main Tabs
+        browser_shell = tk.Frame(self.root, bg="#dbe2ea")
+        browser_shell.pack(fill='x')
+
+        title_bar = tk.Frame(browser_shell, bg="#dbe2ea")
+        title_bar.pack(fill='x', padx=14, pady=(10, 6))
+
+        dot_frame = tk.Frame(title_bar, bg="#dbe2ea")
+        dot_frame.pack(side='left', padx=(0, 12))
+        for color in ("#ef4444", "#f59e0b", "#10b981"):
+            tk.Label(dot_frame, text="●", bg="#dbe2ea", fg=color, font=('Segoe UI', 10)).pack(side='left', padx=2)
+
+        tk.Label(
+            title_bar,
+            text="Dashboard Analisis Ulasan Tokopedia",
+            bg="#dbe2ea",
+            fg=self.TEXT_MAIN,
+            font=('Segoe UI', 11, 'bold')
+        ).pack(side='left')
+
+        browser_bar = tk.Frame(browser_shell, bg="#eef2f7")
+        browser_bar.pack(fill='x', padx=14, pady=(0, 10))
+
+        nav_frame = tk.Frame(browser_bar, bg="#eef2f7")
+        nav_frame.pack(side='left', padx=(0, 10), pady=8)
+        ttk.Button(nav_frame, text="←", width=3, command=lambda: self.notebook.select(self.overview_frame)).pack(side='left', padx=(0, 5))
+        ttk.Button(nav_frame, text="→", width=3, command=lambda: self.notebook.select(self.data_frame)).pack(side='left', padx=(0, 5))
+        ttk.Button(nav_frame, text="↻", width=3, command=self.refresh_dashboard).pack(side='left')
+
+        address_border = tk.Frame(browser_bar, bg="#cbd5e1", padx=1, pady=1)
+        address_border.pack(side='left', fill='x', expand=True, pady=8)
+        address_inner = tk.Frame(address_border, bg="#ffffff")
+        address_inner.pack(fill='x')
+
+        tk.Label(
+            address_inner,
+            text="🔒",
+            bg="#ffffff",
+            fg=self.SUCCESS_COLOR,
+            font=('Segoe UI', 10)
+        ).pack(side='left', padx=(12, 4), pady=8)
+
+        self.dashboard_address_entry = tk.Entry(
+            address_inner,
+            textvariable=self.dashboard_address_var,
+            bg="#ffffff",
+            fg=self.TEXT_MAIN,
+            relief='flat',
+            font=('Segoe UI', 10),
+            insertbackground=self.PRIMARY_COLOR
+        )
+        self.dashboard_address_entry.pack(side='left', fill='x', expand=True, padx=(0, 12), pady=8)
+        self.dashboard_address_entry.bind("<Return>", self.navigate_dashboard_address)
+
+        action_frame = tk.Frame(browser_bar, bg="#eef2f7")
+        action_frame.pack(side='right', padx=(10, 0), pady=8)
+        ttk.Button(action_frame, text="Muat CSV", command=self.load_csv_file, style='Primary.TButton').pack(side='left', padx=(0, 6))
+        ttk.Button(action_frame, text="Ekspor HTML", command=self.export_report, style='Primary.TButton').pack(side='left')
+
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill='both', expand=True, padx=20, pady=(10, 20))
+        self.notebook.pack(fill='both', expand=True, padx=14, pady=(0, 14))
         
         self.overview_frame = ttk.Frame(self.notebook)
+        self.scraper_frame = ttk.Frame(self.notebook)
         self.sentiment_frame = ttk.Frame(self.notebook)
         self.rating_frame = ttk.Frame(self.notebook)
         self.analytics_frame = ttk.Frame(self.notebook)
@@ -143,18 +199,62 @@ class DashboardApp:
         self.data_frame = ttk.Frame(self.notebook)
         
         self.notebook.add(self.overview_frame, text="Ringkasan")
+        self.notebook.add(self.scraper_frame, text="Ambil Data")
         self.notebook.add(self.sentiment_frame, text="Sentimen")
         self.notebook.add(self.rating_frame, text="Rating")
         self.notebook.add(self.analytics_frame, text="Korelasi Data")
         self.notebook.add(self.text_frame, text="Analisis Teks")
         self.notebook.add(self.data_frame, text="Tabel Data")
+        self.notebook.bind("<<NotebookTabChanged>>", self.update_dashboard_address)
         
         self.create_overview_tab()
+        self.create_scraper_tab()
         self.create_sentiment_tab()
         self.create_rating_tab()
         self.create_analytics_tab()
         self.create_text_tab()
         self.create_data_tab()
+
+    def update_dashboard_address(self, _event=None):
+        route_map = {
+            str(self.overview_frame): "ringkasan",
+            str(self.scraper_frame): "ambil-data",
+            str(self.sentiment_frame): "sentimen",
+            str(self.rating_frame): "rating",
+            str(self.analytics_frame): "korelasi",
+            str(self.text_frame): "nlp",
+            str(self.data_frame): "data",
+        }
+        selected = self.notebook.select()
+        route = route_map.get(selected, "ringkasan")
+        self.dashboard_address_var.set(f"tokopedia://dashboard/{route}")
+
+    def navigate_dashboard_address(self, _event=None):
+        target = self.dashboard_address_var.get().strip().lower()
+        route_targets = {
+            "ringkasan": self.overview_frame,
+            "overview": self.overview_frame,
+            "ambil-data": self.scraper_frame,
+            "scraper": self.scraper_frame,
+            "sentimen": self.sentiment_frame,
+            "sentiment": self.sentiment_frame,
+            "rating": self.rating_frame,
+            "korelasi": self.analytics_frame,
+            "analytics": self.analytics_frame,
+            "nlp": self.text_frame,
+            "teks": self.text_frame,
+            "data": self.data_frame,
+            "tabel": self.data_frame,
+        }
+
+        for key, frame in route_targets.items():
+            if key in target:
+                self.notebook.select(frame)
+                self.update_dashboard_address()
+                return
+
+        self.dashboard_address_var.set("tokopedia://dashboard/ringkasan")
+        self.notebook.select(self.overview_frame)
 
     def create_overview_tab(self):
         container = ttk.Frame(self.overview_frame, padding=10)
@@ -658,6 +758,233 @@ class DashboardApp:
         canvas = FigureCanvasTkAgg(fig, master=self.overview_canvas_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    def create_scraper_tab(self):
+        container = ttk.Frame(self.scraper_frame, padding=18)
+        container.pack(fill='both', expand=True)
+
+        browser_border, browser = self.create_card(container)
+        browser_border.pack(fill='both', expand=True)
+
+        top_bar = tk.Frame(browser, bg="#f9fafb")
+        top_bar.pack(fill='x')
+
+        controls = tk.Frame(top_bar, bg="#f9fafb")
+        controls.pack(fill='x', padx=14, pady=12)
+
+        nav_buttons = tk.Frame(controls, bg="#f9fafb")
+        nav_buttons.pack(side='left')
+
+        ttk.Button(nav_buttons, text="↻", width=3, command=self.refresh_dashboard).pack(side='left', padx=(0, 6))
+        ttk.Button(nav_buttons, text="⌂", width=3, command=lambda: self.notebook.select(self.overview_frame)).pack(side='left', padx=(0, 10))
+
+        address_frame = tk.Frame(controls, bg="#e5e7eb", padx=1, pady=1)
+        address_frame.pack(side='left', fill='x', expand=True)
+
+        address_inner = tk.Frame(address_frame, bg="#ffffff")
+        address_inner.pack(fill='x')
+
+        tk.Label(
+            address_inner,
+            text="https://",
+            bg="#ffffff",
+            fg=self.TEXT_MUTED,
+            font=('Segoe UI', 10)
+        ).pack(side='left', padx=(12, 2), pady=8)
+
+        self.scrape_url_entry = tk.Entry(
+            address_inner,
+            textvariable=self.scrape_url_var,
+            bg="#ffffff",
+            fg=self.TEXT_MAIN,
+            relief='flat',
+            font=('Segoe UI', 10),
+            insertbackground=self.PRIMARY_COLOR
+        )
+        self.scrape_url_entry.pack(side='left', fill='x', expand=True, padx=(0, 12), pady=8)
+        self.scrape_url_entry.bind("<Return>", lambda _event: self.start_scraping_from_gui())
+
+        self.scrape_button = ttk.Button(
+            controls,
+            text="Ambil Data",
+            command=self.start_scraping_from_gui,
+            style='Primary.TButton'
+        )
+        self.scrape_button.pack(side='left', padx=(12, 0))
+
+        content = tk.Frame(browser, bg=self.CARD_BG)
+        content.pack(fill='both', expand=True, padx=18, pady=(8, 18))
+
+        tk.Label(
+            content,
+            text="Browser Scraper Tokopedia",
+            bg=self.CARD_BG,
+            fg=self.TEXT_MAIN,
+            font=('Segoe UI', 18, 'bold')
+        ).pack(anchor='w', pady=(8, 4))
+
+        tk.Label(
+            content,
+            text="Masukkan URL produk di address bar, lalu jalankan pengambilan data. Browser Chromium akan tampil sebagai jendela browser asli dan prosesnya tetap berjalan di background aplikasi.",
+            bg=self.CARD_BG,
+            fg=self.TEXT_MUTED,
+            font=('Segoe UI', 10),
+            wraplength=1100,
+            justify='left'
+        ).pack(anchor='w', pady=(0, 16))
+
+        settings = tk.Frame(content, bg=self.CARD_BG)
+        settings.pack(fill='x', pady=(0, 14))
+
+        tk.Label(settings, text="Maks. Ulasan", bg=self.CARD_BG, fg=self.TEXT_MAIN, font=('Segoe UI', 10, 'bold')).pack(
+            side='left', padx=(0, 8)
+        )
+        ttk.Spinbox(settings, from_=1, to=1000, textvariable=self.scrape_limit_var, width=10).pack(
+            side='left', padx=(0, 18)
+        )
+
+        ttk.Checkbutton(settings, text="Gunakan cache jika tersedia", variable=self.scrape_cache_var).pack(
+            side='left', padx=(0, 18)
+        )
+        ttk.Checkbutton(settings, text="Tampilkan browser Chromium", variable=self.scrape_browser_var).pack(
+            side='left'
+        )
+
+        self.scrape_status_label = tk.Label(
+            content,
+            text="Siap. Tempel URL produk Tokopedia di address bar.",
+            bg="#e0f2fe",
+            fg="#0369a1",
+            font=('Segoe UI', 10, 'bold'),
+            anchor='w',
+            justify='left',
+            padx=14,
+            pady=10
+        )
+        self.scrape_status_label.pack(fill='x', pady=(0, 14))
+
+        preview_frame = tk.Frame(content, bg=self.BORDER_COLOR, padx=1, pady=1)
+        preview_frame.pack(fill='both', expand=True)
+
+        preview_inner = tk.Frame(preview_frame, bg=self.CARD_BG)
+        preview_inner.pack(fill='both', expand=True)
+
+        tk.Label(
+            preview_inner,
+            text="Hasil Pengambilan Data",
+            bg=self.CARD_BG,
+            fg=self.TEXT_MAIN,
+            font=('Segoe UI', 12, 'bold')
+        ).pack(anchor='w', padx=14, pady=(12, 8))
+
+        columns = ("ID", "Review", "Rating", "Sentiment")
+        self.scrape_preview_tree = ttk.Treeview(preview_inner, columns=columns, show='headings', height=12)
+        self.scrape_preview_tree.heading("ID", text="ID")
+        self.scrape_preview_tree.heading("Review", text="Review")
+        self.scrape_preview_tree.heading("Rating", text="Rating")
+        self.scrape_preview_tree.heading("Sentiment", text="Sentiment")
+        self.scrape_preview_tree.column("ID", width=70, anchor=tk.CENTER)
+        self.scrape_preview_tree.column("Review", width=900, anchor=tk.W)
+        self.scrape_preview_tree.column("Rating", width=100, anchor=tk.CENTER)
+        self.scrape_preview_tree.column("Sentiment", width=140, anchor=tk.CENTER)
+
+        preview_scroll = ttk.Scrollbar(preview_inner, orient='vertical', command=self.scrape_preview_tree.yview)
+        self.scrape_preview_tree.configure(yscroll=preview_scroll.set)
+        self.scrape_preview_tree.pack(side='left', fill='both', expand=True, padx=(14, 0), pady=(0, 14))
+        preview_scroll.pack(side='right', fill='y', padx=(0, 14), pady=(0, 14))
+
+    def set_scrape_status(self, text, state="info"):
+        colors = {
+            "info": ("#e0f2fe", "#0369a1"),
+            "running": ("#fef3c7", "#92400e"),
+            "success": ("#d1fae5", "#065f46"),
+            "error": ("#fee2e2", "#991b1b"),
+        }
+        bg, fg = colors.get(state, colors["info"])
+        self.scrape_status_label.config(text=text, bg=bg, fg=fg)
+
+    def start_scraping_from_gui(self):
+        if scrape_reviews_advanced is None:
+            messagebox.showerror("Dependency Error", "scraper_ecomm_advanced.py gagal dimuat.")
+            return
+
+        if self.scrape_thread and self.scrape_thread.is_alive():
+            messagebox.showinfo("Proses Berjalan", "Scraper masih berjalan. Tunggu proses selesai.")
+            return
+
+        url = self.scrape_url_var.get().strip()
+        if url.startswith("https://https://"):
+            url = url.replace("https://https://", "https://", 1)
+            self.scrape_url_var.set(url)
+        if not url:
+            messagebox.showwarning("URL Kosong", "Masukkan URL produk Tokopedia terlebih dahulu.")
+            return
+        if not url.startswith(("http://", "https://")):
+            messagebox.showwarning("URL Tidak Valid", "URL harus diawali http:// atau https://.")
+            return
+
+        try:
+            max_reviews = int(self.scrape_limit_var.get())
+            if max_reviews <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Jumlah Tidak Valid", "Maks. ulasan harus berupa angka lebih dari 0.")
+            return
+
+        self.scrape_button.config(state='disabled')
+        self.clear_scrape_preview()
+        self.scrape_last_url = url
+        self.set_scrape_status("Loading halaman di browser Chromium. Proses pengambilan data berjalan di background.", "running")
+
+        options = {
+            "url": url,
+            "max_reviews": max_reviews,
+            "use_cache": self.scrape_cache_var.get(),
+            "headless": not self.scrape_browser_var.get(),
+        }
+        self.scrape_thread = threading.Thread(target=self.run_scraper_worker, args=(options,), daemon=True)
+        self.scrape_thread.start()
+
+    def run_scraper_worker(self, options):
+        try:
+            data = asyncio.run(scrape_reviews_advanced(**options))
+            if not data:
+                self.root.after(0, self.finish_scraper_worker, False, "Tidak ada ulasan valid yang berhasil diekstrak.")
+                return
+
+            save_to_csv(data, "dataset_ulasan_tokopedia.csv")
+            save_to_json(data, "dataset_ulasan_tokopedia.json")
+            self.root.after(0, self.finish_scraper_worker, True, f"Selesai. {len(data)} ulasan disimpan ke CSV dan JSON.", data)
+        except Exception as e:
+            self.root.after(0, self.finish_scraper_worker, False, f"Gagal mengambil data: {e}")
+
+    def finish_scraper_worker(self, success, message, data=None):
+        self.scrape_button.config(state='normal')
+        self.set_scrape_status(message, "success" if success else "error")
+        if success:
+            self.update_scrape_preview(data or [])
+            self.load_data()
+
+    def clear_scrape_preview(self):
+        if not hasattr(self, 'scrape_preview_tree'):
+            return
+        for item in self.scrape_preview_tree.get_children():
+            self.scrape_preview_tree.delete(item)
+
+    def update_scrape_preview(self, data):
+        self.clear_scrape_preview()
+        if not hasattr(self, 'scrape_preview_tree'):
+            return
+
+        for index, row in enumerate(data[:100], start=1):
+            text = str(row.get("review_text", "")).strip()
+            snippet = text[:130] + ("..." if len(text) > 130 else "")
+            self.scrape_preview_tree.insert("", "end", values=(
+                row.get("id", index),
+                snippet,
+                row.get("rating", 0),
+                str(row.get("sentiment", "neutral")).capitalize(),
+            ))
 
     def draw_sentiment_chart(self):
         self.clear_frame(self.sentiment_canvas_frame)

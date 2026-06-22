@@ -1,6 +1,14 @@
 import asyncio
 import argparse
-import pandas as pd
+import csv
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
 import re
 import random
 import json
@@ -8,8 +16,11 @@ import hashlib
 import logging
 import os
 import sys
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import Stealth
 from datetime import datetime, timedelta
@@ -33,6 +44,163 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+DEFAULT_HTTP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def can_launch_headed_browser() -> bool:
+    """Return False in Linux server environments that do not expose a display."""
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
+def normalize_url(url: str) -> str:
+    """Drop fragments and normalize whitespace so the same product URL caches consistently."""
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        return cleaned
+
+    parts = urlsplit(cleaned)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+
+
+def build_review_page_url(url: str) -> str:
+    """Build Tokopedia product review page URL from a product URL."""
+    parts = urlsplit(normalize_url(url))
+    path = parts.path.rstrip("/")
+    if not path.endswith("/review"):
+        path = f"{path}/review"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def resolve_short_url(url: str) -> str:
+    """Resolve Tokopedia short links before handing the URL to Chromium."""
+    url = normalize_url(url)
+    if "tk.tokopedia.com" not in url.lower():
+        return url
+
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"User-Agent": DESKTOP_USER_AGENT, **DEFAULT_HTTP_HEADERS},
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler)
+    try:
+        opener.open(request, timeout=15)
+    except urllib.error.HTTPError as exc:
+        location = exc.headers.get("Location")
+        if location:
+            logger.info("Resolved Tokopedia short link to product URL.")
+            return normalize_url(urllib.request.urljoin(url, location))
+    except Exception as exc:
+        logger.warning(f"Short-link resolve failed, using original URL: {exc}")
+
+    return url
+
+
+def extract_reviews_from_review_page_html(html_text: str, max_reviews: int) -> List[Dict]:
+    """Extract SSR review records from Tokopedia /review page cache."""
+    reviews = []
+    seen = set()
+    pattern = re.compile(
+        r'"reviewListPDPType\d+":(\{.*?"__typename":"reviewListPDPType"\})',
+        re.DOTALL,
+    )
+
+    for match in pattern.finditer(html_text or ""):
+        if len(reviews) >= max_reviews:
+            break
+
+        try:
+            payload = json.loads(match.group(1))
+        except Exception:
+            continue
+
+        text = sanitize_text(payload.get("message", ""))
+        content_hash = compute_content_hash(text)
+        if not text or content_hash in seen:
+            continue
+
+        try:
+            rating = int(float(payload.get("productRating") or 0))
+        except Exception:
+            rating = 0
+
+        review = create_review_record(len(reviews) + 1, text, rating)
+        timestamp = str(payload.get("reviewCreateTime") or "")
+        if timestamp.isdigit():
+            review["date_scraped"] = datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+        review["source"] = "tokopedia_review_page"
+        review["feedback_id"] = str(payload.get("feedbackID") or "")
+        review["review_timestamp_label"] = str(payload.get("reviewCreateTimestamp") or "")
+
+        is_valid, _ = validate_review(review)
+        if is_valid:
+            reviews.append(review)
+            seen.add(content_hash)
+
+    return reviews
+
+
+def fetch_reviews_from_review_page(url: str, max_reviews: int) -> List[Dict]:
+    """Fetch Tokopedia /review SSR page with Chrome impersonation and parse embedded reviews."""
+    if curl_requests is None:
+        logger.info("curl_cffi is not installed; skipping HTTP review-page fallback.")
+        return []
+
+    if "tk.tokopedia.com" in url.lower():
+        try:
+            resolved = curl_requests.get(
+                normalize_url(url),
+                impersonate="chrome124",
+                timeout=20,
+                allow_redirects=True,
+                headers=DEFAULT_HTTP_HEADERS,
+            )
+            if resolved.url:
+                url = normalize_url(resolved.url)
+                logger.info("HTTP fallback resolved Tokopedia short link.")
+        except Exception as exc:
+            logger.warning(f"HTTP fallback short-link resolve failed: {exc}")
+
+    review_url = build_review_page_url(url)
+    try:
+        logger.info(f"HTTP fallback: fetching review page {review_url[:90]}...")
+        response = curl_requests.get(
+            review_url,
+            impersonate="chrome124",
+            timeout=25,
+            allow_redirects=True,
+            headers=DEFAULT_HTTP_HEADERS,
+        )
+        if response.status_code >= 400:
+            logger.warning(f"HTTP fallback review page returned status {response.status_code}")
+            return []
+    except Exception as exc:
+        logger.warning(f"HTTP fallback review page failed: {exc}")
+        return []
+
+    reviews = extract_reviews_from_review_page_html(response.text, max_reviews)
+    if reviews:
+        logger.info(f"HTTP fallback extracted {len(reviews)} reviews from Tokopedia /review SSR cache.")
+    else:
+        logger.info("HTTP fallback found no embedded review rows.")
+    return enrich_reviews_with_nlp(reviews)
+
 # Cache configuration
 CACHE_DIR = Path("scraper_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -46,12 +214,14 @@ class ScraperConfig:
     SCROLL_PAUSE_TIME = (0.5, 1.5)  # min, max
     SCROLL_ITERATIONS = 15
     ELEMENT_WAIT_TIMEOUT = 10000  # ms
-    PAGE_LOAD_TIMEOUT = 60000  # ms
+    PAGE_LOAD_TIMEOUT = 25000  # ms
+    DEFAULT_TIMEOUT = 15000  # ms
+    NETWORK_QUIET_TIMEOUT = 8000  # ms
     RATE_LIMIT_DELAY = 2  # seconds between requests
     MAX_CONCURRENT_TASKS = 2
     MIN_REVIEW_TEXT_LENGTH = 5
     REVIEW_LOAD_TIMEOUT = 90
-    HEADLESS = False
+    HEADLESS = not can_launch_headed_browser()
 
 config = ScraperConfig()
 
@@ -950,6 +1120,69 @@ async def wait_for_new_content(page, last_height: int, timeout_ms: int = 5000) -
     except:
         return False, last_height
 
+
+async def wait_for_review_network_quiet(network_review_candidates: Dict, timeout_ms: int) -> int:
+    """Wait until no new review candidates arrive for a short window."""
+    start = time.time()
+    last_count = len(network_review_candidates)
+    last_change = start
+
+    while (time.time() - start) * 1000 < timeout_ms:
+        await asyncio.sleep(0.5)
+        current_count = len(network_review_candidates)
+        if current_count != last_count:
+            last_count = current_count
+            last_change = time.time()
+
+        if current_count > 0 and (time.time() - last_change) >= 1.5:
+            return current_count
+
+    return len(network_review_candidates)
+
+
+async def navigate_product_page(page, url: str) -> bool:
+    """Navigate with a fast dynamic-page strategy and a commit fallback."""
+    if "tokopedia.com" in url.lower():
+        try:
+            await asyncio.wait_for(
+                page.goto(url, wait_until="commit", timeout=15000),
+                timeout=20,
+            )
+            logger.info("✓ Page navigation committed")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                logger.info("✓ Page DOM content loaded after commit")
+                return True
+            except PlaywrightTimeoutError:
+                logger.warning("⚠️ DOMContentLoaded still pending after commit, continuing with committed page.")
+                return False
+        except Exception as exc:
+            logger.warning(f"Commit-first navigation failed: {exc}")
+            raise
+
+    try:
+        await asyncio.wait_for(
+            page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT),
+            timeout=(config.PAGE_LOAD_TIMEOUT / 1000) + 5,
+        )
+        logger.info("✓ Page DOM content loaded")
+        return True
+    except (asyncio.TimeoutError, PlaywrightTimeoutError):
+        logger.warning("⚠️ DOMContentLoaded timeout, checking committed document state...")
+        if page.url and page.url != "about:blank":
+            return False
+
+        try:
+            await asyncio.wait_for(
+                page.goto(url, wait_until="commit", timeout=10000),
+                timeout=15,
+            )
+            logger.info("✓ Page navigation committed")
+            return False
+        except Exception as exc:
+            logger.warning(f"Commit fallback failed: {exc}")
+            raise
+
 # ==========================================
 # 4. ADVANCED SCRAPING WITH RETRY LOGIC
 # ==========================================
@@ -970,12 +1203,19 @@ async def scrape_reviews_advanced(
     - Better error recovery dan validation
     - Rate limiting untuk respect server
     """
+    url = resolve_short_url(url)
     
     # Check cache terlebih dahulu
     if use_cache:
         cached_data = load_from_cache(url)
         if cached_data:
             return cached_data
+
+    http_reviews = fetch_reviews_from_review_page(url, max_reviews)
+    if http_reviews:
+        if use_cache:
+            save_to_cache(url, http_reviews)
+        return http_reviews
     
     # Rate limiting
     if retry_count > 0:
@@ -985,6 +1225,10 @@ async def scrape_reviews_advanced(
     
     reviews_data = []
     reviews_hash_set = set()  # Untuk deduplicasi yang lebih akurat
+    effective_headless = config.HEADLESS if headless is None else headless
+    if not effective_headless and not can_launch_headed_browser():
+        logger.warning("Browser visual diminta, tetapi XServer/DISPLAY tidak tersedia. Menggunakan mode headless.")
+        effective_headless = True
     
     async with async_playwright() as p:
         browser = None
@@ -992,20 +1236,32 @@ async def scrape_reviews_advanced(
             logger.info(f"🌐 Starting scraper untuk: {url[:60]}...")
             
             browser = await p.chromium.launch(
-                headless=config.HEADLESS if headless is None else headless
+                headless=effective_headless,
+                args=[
+                    "--disable-http2",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ]
             )
             
             context = await browser.new_context(
                 viewport={'width': 1366, 'height': 768},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                user_agent=DESKTOP_USER_AGENT,
+                locale="id-ID",
+                timezone_id="Asia/Jakarta",
+                extra_http_headers=DEFAULT_HTTP_HEADERS,
+                service_workers="block",
             )
+            context.set_default_timeout(config.DEFAULT_TIMEOUT)
+            context.set_default_navigation_timeout(config.PAGE_LOAD_TIMEOUT)
             page = await context.new_page()
             network_review_candidates = {}
+            review_response_urls = set()
 
             async def collect_review_response(response):
                 try:
                     url_lower = response.url.lower()
-                    if not any(keyword in url_lower for keyword in ["review", "ulasan", "graphql", "pdp"]):
+                    if not any(keyword in url_lower for keyword in ["review", "ulasan", "graphql", "pdp", "rating"]):
                         return
 
                     content_type = response.headers.get("content-type", "").lower()
@@ -1013,8 +1269,11 @@ async def scrape_reviews_advanced(
                         return
 
                     data = await response.json()
+                    before_count = len(network_review_candidates)
                     for text, rating in extract_review_candidates_from_json(data):
                         network_review_candidates[compute_content_hash(text)] = (text, rating)
+                    if len(network_review_candidates) > before_count:
+                        review_response_urls.add(response.url)
                 except Exception:
                     return
 
@@ -1029,19 +1288,22 @@ async def scrape_reviews_advanced(
             
             # Page load dengan timeout adaptif
             try:
-                await page.goto(url, wait_until="load", timeout=config.PAGE_LOAD_TIMEOUT)
-                logger.info("✓ Page loaded successfully")
-            except PlaywrightTimeoutError:
-                logger.warning("⚠️ Page load timeout, continuing with available content...")
+                await navigate_product_page(page, url)
             except Exception as e:
                 logger.error(f"❌ Page load error: {e}")
-                if retry_count < config.MAX_RETRIES:
-                    logger.info(f"🔄 Retrying... ({retry_count + 1}/{config.MAX_RETRIES})")
-                    return await scrape_reviews_advanced(url, max_reviews, use_cache, retry_count + 1, headless)
                 raise
             
             # Wait untuk konten dirender
             await asyncio.sleep(3)
+            network_count = await wait_for_review_network_quiet(
+                network_review_candidates,
+                config.NETWORK_QUIET_TIMEOUT
+            )
+            if network_count:
+                logger.info(
+                    f"Network capture collected {network_count} review candidates "
+                    f"from {len(review_response_urls)} response(s)."
+                )
             
             # Detect lazy loading
             has_lazy = await detect_lazy_loading(page)
@@ -1167,6 +1429,33 @@ async def scrape_reviews_advanced(
             # ===== EXTRACT REVIEW DETAILS WITH VALIDATION =====
             extracted_count = 0
             skipped_count = 0
+
+            if network_review_candidates:
+                logger.info(f"Trying network JSON extraction with {len(network_review_candidates)} candidates...")
+
+                for safe_text, rating in network_review_candidates.values():
+                    if len(reviews_data) >= max_reviews:
+                        break
+
+                    review_obj = create_review_record(
+                        len(reviews_data) + 1,
+                        safe_text,
+                        rating
+                    )
+
+                    is_valid, validation_msg = validate_review(review_obj)
+                    if not is_valid:
+                        skipped_count += 1
+                        logger.debug(f"Skipped network review: {validation_msg}")
+                        continue
+
+                    content_hash = compute_content_hash(safe_text)
+                    if content_hash in reviews_hash_set:
+                        continue
+
+                    reviews_data.append(review_obj)
+                    reviews_hash_set.add(content_hash)
+                    extracted_count += 1
             
             for index, element in enumerate(all_review_elements):
                 if len(reviews_data) >= max_reviews:
@@ -1206,33 +1495,6 @@ async def scrape_reviews_advanced(
             logger.info(f"Selector extraction result: {extracted_count} valid, {skipped_count} skipped")
             if not reviews_data:
                 await asyncio.sleep(1)
-
-            if not reviews_data and network_review_candidates:
-                logger.info(f"Trying network JSON fallback with {len(network_review_candidates)} candidates...")
-
-                for safe_text, rating in network_review_candidates.values():
-                    if len(reviews_data) >= max_reviews:
-                        break
-
-                    review_obj = create_review_record(
-                        len(reviews_data) + 1,
-                        safe_text,
-                        rating
-                    )
-
-                    is_valid, validation_msg = validate_review(review_obj)
-                    if not is_valid:
-                        skipped_count += 1
-                        logger.debug(f"Skipped network review: {validation_msg}")
-                        continue
-
-                    content_hash = compute_content_hash(safe_text)
-                    if content_hash in reviews_hash_set:
-                        continue
-
-                    reviews_data.append(review_obj)
-                    reviews_hash_set.add(content_hash)
-                    extracted_count += 1
 
             if not reviews_data:
                 logger.info("No reviews found with selectors. Trying visible-text fallback...")
@@ -1306,10 +1568,26 @@ def save_to_csv(data: list, filename: str) -> bool:
     
     try:
         data = enrich_reviews_with_nlp(data)
-        df = pd.DataFrame(data)
-        df = df.sort_values('date_scraped', ascending=False)
-        df.to_csv(filename, index=False, encoding='utf-8')
-        logger.info(f"✓ CSV saved: {filename} ({len(df)} rows)")
+        if pd is not None:
+            df = pd.DataFrame(data)
+            df = df.sort_values('date_scraped', ascending=False)
+            df.to_csv(filename, index=False, encoding='utf-8')
+            row_count = len(df)
+        else:
+            sorted_data = sorted(data, key=lambda row: str(row.get('date_scraped', '')), reverse=True)
+            fieldnames = []
+            for row in sorted_data:
+                for key in row.keys():
+                    if key not in fieldnames:
+                        fieldnames.append(key)
+
+            with open(filename, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(sorted_data)
+            row_count = len(sorted_data)
+
+        logger.info(f"✓ CSV saved: {filename} ({row_count} rows)")
         return True
     except Exception as e:
         logger.error(f"❌ Error saving CSV: {e}")
@@ -1336,39 +1614,101 @@ def print_statistics(data: List[Dict]):
     if not data:
         logger.warning("No data to analyze")
         return
-    
-    df = pd.DataFrame(data)
+
+    if pd is not None:
+        df = pd.DataFrame(data)
+        
+        logger.info("\n" + "=" * 70)
+        logger.info("📊 SCRAPING STATISTICS")
+        logger.info("=" * 70)
+        logger.info(f"Total Reviews Extracted: {len(df)}")
+        logger.info(f"Date Range: {df['date_scraped'].min()} to {df['date_scraped'].max()}")
+        
+        if 'rating' in df.columns:
+            logger.info(f"\n⭐ Rating Distribution:")
+            logger.info(f"  Average: {df['rating'].mean():.2f}/5")
+            logger.info(f"  Median: {df['rating'].median():.1f}/5")
+            logger.info(f"  Std Dev: {df['rating'].std():.2f}")
+            logger.info(f"  Min: {df['rating'].min()} | Max: {df['rating'].max()}")
+            
+            rating_dist = df['rating'].value_counts().sort_index(ascending=False)
+            for rating, count in rating_dist.items():
+                percentage = (count / len(df)) * 100
+                logger.info(f"    {int(rating)} stars: {count:3d} ({percentage:5.1f}%)")
+        
+        if 'sentiment' in df.columns:
+            logger.info(f"\n💭 Sentiment Distribution:")
+            sentiment_dist = df['sentiment'].value_counts()
+            for sentiment, count in sentiment_dist.items():
+                percentage = (count / len(df)) * 100
+                logger.info(f"    {sentiment.capitalize():10s}: {count:3d} ({percentage:5.1f}%)")
+        
+        if 'text_length' in df.columns:
+            logger.info(f"\n📝 Text Length Statistics:")
+            logger.info(f"  Average: {df['text_length'].mean():.0f} characters")
+            logger.info(f"  Median: {df['text_length'].median():.0f} characters")
+            logger.info(f"  Min: {df['text_length'].min()} | Max: {df['text_length'].max()}")
+        
+        logger.info("=" * 70)
+        return
+
+    ratings = []
+    sentiments = Counter()
+    text_lengths = []
+    dates = []
+    for row in data:
+        try:
+            rating = int(float(row.get('rating', 0)))
+            if 0 <= rating <= 5:
+                ratings.append(rating)
+        except Exception:
+            pass
+
+        sentiment = str(row.get('sentiment', 'neutral') or 'neutral').lower()
+        sentiments[sentiment] += 1
+
+        try:
+            text_lengths.append(int(float(row.get('text_length', len(str(row.get('review_text', '')))))))
+        except Exception:
+            text_lengths.append(len(str(row.get('review_text', ''))))
+
+        if row.get('date_scraped'):
+            dates.append(str(row.get('date_scraped')))
     
     logger.info("\n" + "=" * 70)
     logger.info("📊 SCRAPING STATISTICS")
     logger.info("=" * 70)
-    logger.info(f"Total Reviews Extracted: {len(df)}")
-    logger.info(f"Date Range: {df['date_scraped'].min()} to {df['date_scraped'].max()}")
+    logger.info(f"Total Reviews Extracted: {len(data)}")
+    if dates:
+        logger.info(f"Date Range: {min(dates)} to {max(dates)}")
     
-    if 'rating' in df.columns:
+    if ratings:
         logger.info(f"\n⭐ Rating Distribution:")
-        logger.info(f"  Average: {df['rating'].mean():.2f}/5")
-        logger.info(f"  Median: {df['rating'].median():.1f}/5")
-        logger.info(f"  Std Dev: {df['rating'].std():.2f}")
-        logger.info(f"  Min: {df['rating'].min()} | Max: {df['rating'].max()}")
+        sorted_ratings = sorted(ratings)
+        median = sorted_ratings[len(sorted_ratings) // 2]
+        logger.info(f"  Average: {sum(ratings) / len(ratings):.2f}/5")
+        logger.info(f"  Median: {median:.1f}/5")
+        logger.info(f"  Min: {min(ratings)} | Max: {max(ratings)}")
         
-        rating_dist = df['rating'].value_counts().sort_index(ascending=False)
-        for rating, count in rating_dist.items():
-            percentage = (count / len(df)) * 100
+        rating_dist = Counter(ratings)
+        for rating in sorted(rating_dist.keys(), reverse=True):
+            count = rating_dist[rating]
+            percentage = (count / len(data)) * 100
             logger.info(f"    {int(rating)} stars: {count:3d} ({percentage:5.1f}%)")
     
-    if 'sentiment' in df.columns:
+    if sentiments:
         logger.info(f"\n💭 Sentiment Distribution:")
-        sentiment_dist = df['sentiment'].value_counts()
-        for sentiment, count in sentiment_dist.items():
-            percentage = (count / len(df)) * 100
+        for sentiment, count in sentiments.most_common():
+            percentage = (count / len(data)) * 100
             logger.info(f"    {sentiment.capitalize():10s}: {count:3d} ({percentage:5.1f}%)")
     
-    if 'text_length' in df.columns:
+    if text_lengths:
+        sorted_lengths = sorted(text_lengths)
+        median_length = sorted_lengths[len(sorted_lengths) // 2]
         logger.info(f"\n📝 Text Length Statistics:")
-        logger.info(f"  Average: {df['text_length'].mean():.0f} characters")
-        logger.info(f"  Median: {df['text_length'].median():.0f} characters")
-        logger.info(f"  Min: {df['text_length'].min()} | Max: {df['text_length'].max()}")
+        logger.info(f"  Average: {sum(text_lengths) / len(text_lengths):.0f} characters")
+        logger.info(f"  Median: {median_length:.0f} characters")
+        logger.info(f"  Min: {min(text_lengths)} | Max: {max(text_lengths)}")
     
     logger.info("=" * 70)
 
@@ -1502,4 +1842,3 @@ async def main(cli_args: Optional[List[str]] = None):
 
 if __name__ == "__main__":
     asyncio.run(main())
-

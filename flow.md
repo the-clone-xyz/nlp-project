@@ -1,70 +1,80 @@
 # Flow Project NLP2
 
-Dokumen ini menjelaskan alur kerja sistem, struktur project, dan peran tiap file utama pada aplikasi scraper dan dashboard analisis ulasan Tokopedia.
+Dokumen ini menjelaskan alur sistem terbaru untuk scraper ulasan Tokopedia, pipeline NLP, penyimpanan dataset, dan dashboard browser yang dipakai untuk presentasi project.
 
 ## Ringkasan Sistem
 
-Project ini berisi pipeline sederhana untuk mengambil ulasan produk dari Tokopedia, membersihkan teks, memberi label sentimen, menyimpan hasil ke CSV/JSON, lalu menampilkan hasilnya di dashboard desktop berbasis Tkinter.
+NLP2 mengambil ulasan produk Tokopedia, membersihkan teks, menjalankan tahapan NLP, menyimpan hasil ke CSV/JSON, lalu menampilkan proses dan hasil analisis di dashboard web.
 
-Komponen utama:
+Fokus sistem saat ini:
 
-- `main.py`: menu launcher untuk menjalankan scraper, dashboard, statistik, dependency check, dan cleanup.
-- `scraper_ecomm_advanced.py`: scraper utama dengan Playwright, caching, retry, validasi review, sentiment analysis, dan export data.
-- `dashboard.py`: dashboard desktop untuk membaca CSV dan menampilkan statistik/grafik.
-- `scraper_ecomm.py`: scraper versi lama/sederhana, masih berguna sebagai referensi atau fallback.
-- `dataset_ulasan_tokopedia.csv`: output CSV yang dibaca dashboard.
-- `dataset_ulasan_tokopedia.json`: output JSON hasil scraping.
-- `requirements_final.txt`: daftar dependency Python.
+- Mengambil data real dari halaman produk/review Tokopedia.
+- Menghindari data dummy atau metadata halaman seperti `Detail Produk`.
+- Menjalankan pipeline NLP: Tokenization, Stopword Removal, Stemming, dan Vectorization.
+- Menampilkan alur bertahap di GUI agar mudah dijelaskan saat presentasi.
 
-## Alur Sistem Utama
+## Komponen Utama
+
+| File | Peran |
+| --- | --- |
+| `web_dashboard.py` | Dashboard browser utama, endpoint API data, endpoint scraper, log scraping, dan tampilan alur presentasi. |
+| `scraper_ecomm_advanced.py` | Scraper utama, fallback HTTP Tokopedia, validasi review, sentiment analysis, NLP enrichment, export CSV/JSON. |
+| `main.py` | Launcher CLI/menu untuk menjalankan scraper, dashboard desktop, statistik, dependency check, dan cleanup. |
+| `dashboard.py` | Dashboard desktop Tkinter legacy. Masih bisa dipakai, tetapi dashboard utama sekarang `web_dashboard.py`. |
+| `scraper_ecomm.py` | Scraper versi awal/legacy. |
+| `dataset_ulasan_tokopedia.csv` | Dataset utama yang dibaca dashboard browser. |
+| `dataset_ulasan_tokopedia.json` | Export JSON hasil scraping. |
+| `requirements_final.txt` | Dependency Python, termasuk `curl_cffi` untuk fallback HTTP. |
+
+## Alur Besar Sistem
 
 ```text
 User
   |
   v
-main.py
+web_dashboard.py
   |
-  +-- Option 1: Run scraper
-  |     |
-  |     v
-  |   scraper_ecomm_advanced.py
-  |     |
-  |     +-- validasi URL dan konfigurasi scraping
-  |     +-- buka Chromium lewat Playwright
-  |     +-- aktifkan stealth mode
-  |     +-- buka halaman produk Tokopedia
-  |     +-- scroll dan buka section ulasan
-  |     +-- ekstrak kandidat teks ulasan
-  |     +-- filter noise/metadata halaman
-  |     +-- ekstrak rating jika tersedia
-  |     +-- analisis sentimen
-  |     +-- deduplikasi review
-  |     +-- simpan CSV dan JSON
+  +-- Tab 1 Ringkasan
+  |     +-- status dataset
+  |     +-- ringkasan jumlah review, rating, sentimen, vocabulary
+  |     +-- panel Alur Project untuk presentasi
   |
-  +-- Option 2: Launch dashboard
-  |     |
-  |     v
-  |   dashboard.py
-  |     |
-  |     +-- baca dataset_ulasan_tokopedia.csv
-  |     +-- normalisasi kolom
-  |     +-- hitung statistik
-  |     +-- render grafik
-  |     +-- tampilkan tabel data
+  +-- Tab 2 Scraping
+  |     +-- input URL produk Tokopedia
+  |     +-- pilih max_reviews, cache, dan mode browser
+  |     +-- jalankan worker scraper
+  |     +-- tampilkan log tahapan scraping
   |
-  +-- Option 3: View statistics
-  |     |
-  |     v
-  |   baca CSV dan tampilkan ringkasan di terminal
+  +-- Tab 3 Data Mentah
+  |     +-- tampilkan review_text, rating, sentimen, sumber, tanggal
+  |     +-- pencarian review/token/sentimen
+  |
+  +-- Tab 4 NLP
+  |     +-- tampilkan contoh alur dari satu ulasan
+  |     +-- tampilkan Tokenization
+  |     +-- tampilkan Stopword Removal
+  |     +-- tampilkan Stemming
+  |     +-- tampilkan Vectorization
+  |
+  +-- Tab 5 Rating
+  |     +-- distribusi rating
+  |
+  +-- Tab 6 Sentimen
+        +-- distribusi positive/neutral/negative
 ```
 
-## Flow Scraper
+## Alur Scraping Terbaru
+
+Scraper sekarang punya dua jalur. Jalur pertama lebih cepat dan lebih stabil untuk Tokopedia karena tidak bergantung pada `page.goto()` Playwright.
 
 ```text
-Input URL produk
+Input URL produk / short-link
   |
   v
-parse config
+normalize URL
+  |
+  v
+resolve short-link tk.tokopedia.com
   |
   v
 cek cache jika diaktifkan
@@ -72,147 +82,217 @@ cek cache jika diaktifkan
   +-- cache valid -> return data cache
   |
   v
-launch browser
+HTTP fallback via curl_cffi
+  |
+  +-- impersonate Chrome
+  +-- buka halaman /review
+  +-- parse SSR cache window.__cache
+  +-- ambil reviewListPDPType
+  |
+  +-- berhasil -> enrich NLP -> save CSV/JSON
   |
   v
-open product page
+Fallback Playwright
   |
-  v
-open/scroll review section
-  |
-  v
-extract review candidates
-  |
-  +-- selector review spesifik Tokopedia
+  +-- launch Chromium headless jika tidak ada DISPLAY/XServer
+  +-- context locale id-ID dan timezone Asia/Jakarta
+  +-- service worker diblok agar response network bisa ditangkap
+  +-- capture response review/graphql/pdp/rating
+  +-- buka halaman dengan strategi commit/domcontentloaded
+  +-- scroll dan buka section ulasan
+  +-- selector extraction
   +-- network JSON fallback
   +-- visible text fallback
   |
   v
-sanitize text
-  |
-  v
-validate review text
-  |
-  +-- buang metadata/noise seperti ringkasan rating, deskripsi produk, dan teks navigasi
-  |
-  v
-extract rating
-  |
-  v
-analyze sentiment
-  |
-  v
-deduplicate by content hash
-  |
-  v
-save CSV/JSON
+sanitize -> validate -> sentiment -> deduplicate -> enrich NLP -> save
 ```
 
-## Flow Dashboard
+### Kenapa Ada HTTP Fallback
+
+Pada beberapa environment, Playwright dapat gagal dengan:
 
 ```text
-Start dashboard.py
-  |
-  v
-load dataset_ulasan_tokopedia.csv
-  |
-  v
-prepare_dataframe
-  |
-  +-- pastikan kolom review_text tersedia
-  +-- rating dikonversi ke angka 0-5
-  +-- sentiment dinormalisasi ke positive/negative/neutral
-  +-- text_length dihitung jika tidak tersedia
-  |
-  v
-update_dashboard
-  |
-  +-- update kartu statistik
-  +-- render distribusi sentimen
-  +-- render distribusi rating
-  +-- render korelasi rating-sentimen
-  +-- isi tabel review
+Page.goto: Timeout ... waiting until "commit"
 ```
 
-## Struktur Project
+atau sebelumnya:
 
 ```text
-NLP2/
-|-- main.py
-|-- scraper_ecomm_advanced.py
-|-- scraper_ecomm.py
-|-- dashboard.py
-|-- dataset_ulasan_tokopedia.csv
-|-- dataset_ulasan_tokopedia.json
-|-- requirements_final.txt
-|-- README.md
-|-- CHANGELOG.md
-|-- SCRAPER_IMPROVEMENTS.md
-|-- DASHBOARD_IMPROVEMENTS.md
-|-- flow.md
-|-- .gitignore
-`-- nlp_env/
+net::ERR_HTTP2_PROTOCOL_ERROR
 ```
 
-## Peran File
+Karena itu scraper menggunakan `curl_cffi` untuk mengambil halaman `/review` dengan Chrome impersonation. Untuk halaman review Tokopedia, data komentar sering sudah tersedia di SSR cache dalam bentuk `reviewListPDPType`, sehingga review bisa diambil tanpa menunggu browser render penuh.
 
-| File | Peran |
-| --- | --- |
-| `main.py` | Entry point berbasis menu untuk user non-teknis. |
-| `scraper_ecomm_advanced.py` | Scraper utama dan pipeline ekstraksi data. |
-| `scraper_ecomm.py` | Scraper versi awal, sebaiknya dianggap legacy/reference. |
-| `dashboard.py` | GUI analitik untuk membaca dan memvisualisasikan CSV. |
-| `dataset_ulasan_tokopedia.csv` | Dataset utama untuk dashboard. |
-| `dataset_ulasan_tokopedia.json` | Export JSON untuk kebutuhan integrasi/manual check. |
-| `requirements_final.txt` | Dependency Python yang perlu diinstall. |
-| `.gitignore` | Daftar file/folder generated yang tidak perlu masuk Git. |
+## Alur NLP
+
+Setiap review yang valid diproses menjadi fitur NLP.
+
+```text
+review_text
+  |
+  v
+Tokenization
+  |
+  +-- teks dipecah menjadi token/kata
+  |
+  v
+Stopword Removal
+  |
+  +-- kata umum seperti "yang", "dan", "di", "ke" dihapus
+  |
+  v
+Stemming
+  |
+  +-- token diubah ke bentuk dasar sederhana
+  |
+  v
+Term Frequency
+  |
+  +-- hitung frekuensi setiap stem dalam review
+  |
+  v
+Vectorization
+  |
+  +-- vocabulary corpus dibuat dari term paling sering
+  +-- setiap review diubah menjadi vector numerik
+  +-- nilai vector menunjukkan frekuensi term pada review tersebut
+```
+
+Contoh tampilan Vectorization di GUI:
+
+```text
+term      baik  packing  tv  barang  aman
+value       1        0   0       1     1
+```
+
+Di GUI, vector tidak lagi ditampilkan sebagai tabel horizontal panjang. Vector ditampilkan sebagai grid compact `term -> nilai`, dengan nilai `0` dibuat redup agar tidak bergempetan dan lebih mudah dibaca.
+
+## Alur GUI Untuk Presentasi
+
+Dashboard browser dirancang agar bisa dipakai untuk menjelaskan project secara berurutan.
+
+```text
+1 Ringkasan
+  |
+  +-- Apa status dataset?
+  +-- Berapa review berhasil diambil?
+  +-- Berapa vocabulary NLP?
+
+2 Scraping
+  |
+  +-- Masukkan URL produk
+  +-- Jalankan scraping
+  +-- Tunjukkan log proses
+
+3 Data Mentah
+  |
+  +-- Tunjukkan teks review asli
+  +-- Tunjukkan rating, sentimen, sumber, tanggal
+
+4 NLP
+  |
+  +-- Tunjukkan contoh satu ulasan
+  +-- Jelaskan Tokenization
+  +-- Jelaskan Stopword Removal
+  +-- Jelaskan Stemming
+  +-- Jelaskan Vectorization
+
+5 Rating
+  |
+  +-- Jelaskan distribusi bintang
+
+6 Sentimen
+  |
+  +-- Jelaskan hasil klasifikasi sentimen
+```
+
+Setiap judul tahap NLP di GUI memiliki tooltip `?`:
+
+- `Tokenization ?`
+- `Stopword Removal ?`
+- `Stemming ?`
+- `Vectorization ?`
+
+Saat `?` disorot, dashboard menampilkan pengertian singkat tahap tersebut.
 
 ## Format Output Dataset
 
-Kolom yang diharapkan:
+Kolom utama:
 
 | Kolom | Keterangan |
 | --- | --- |
-| `id` | Nomor urut data. |
+| `id` | Nomor urut review. |
 | `review_text` | Teks ulasan yang sudah dibersihkan. |
-| `rating` | Rating 0-5. Nilai 0 berarti rating tidak ditemukan. |
+| `rating` | Rating 0-5. |
 | `sentiment` | Label `positive`, `negative`, atau `neutral`. |
-| `date_scraped` | Timestamp saat data diambil. |
-| `text_length` | Panjang teks ulasan. |
-| `source` | Sumber data, saat ini `tokopedia`. |
-| `source_url` | URL asal review, ada pada mode multi-URL. |
+| `date_scraped` | Timestamp review atau waktu scraping. |
+| `text_length` | Panjang karakter review. |
+| `source` | Sumber data, misalnya `tokopedia_review_page`. |
+| `feedback_id` | ID feedback dari halaman review Tokopedia jika tersedia. |
+| `review_timestamp_label` | Label waktu dari Tokopedia, misalnya `Lebih dari 1 tahun lalu`. |
+
+Kolom NLP:
+
+| Kolom | Keterangan |
+| --- | --- |
+| `nlp_tokens` | Hasil tokenization. |
+| `nlp_no_stopwords` | Token setelah stopword removal. |
+| `nlp_stems` | Token setelah stemming. |
+| `nlp_term_frequency` | Frekuensi term per review. |
+| `vector_terms` | Vocabulary corpus yang dipakai untuk vectorization. |
+| `vector_values` | Nilai term-frequency review terhadap `vector_terms`. |
+| `vec_*` | Kolom numerik per term untuk analisis lanjutan. |
 
 ## Cara Menjalankan
 
-Gunakan Python dari virtual environment project:
+Install dependency:
 
-```powershell
-.\nlp_env\Scripts\python.exe main.py
+```bash
+python -m pip install -r requirements_final.txt
+python -m playwright install chromium
+```
+
+Menjalankan dashboard browser utama:
+
+```bash
+python web_dashboard.py
+```
+
+Buka:
+
+```text
+http://127.0.0.1:8000
 ```
 
 Menjalankan scraper langsung:
 
-```powershell
-.\nlp_env\Scripts\python.exe scraper_ecomm_advanced.py --url "https://www.tokopedia.com/nama-toko/nama-produk" --max-reviews 100 --no-cache
+```bash
+python scraper_ecomm_advanced.py --url "https://www.tokopedia.com/nama-toko/nama-produk" --max-reviews 100 --no-cache --headless
 ```
 
-Menjalankan dashboard:
+Menjalankan launcher CLI:
 
-```powershell
-.\nlp_env\Scripts\python.exe dashboard.py
+```bash
+python main.py
 ```
 
 ## Catatan Kualitas Data
 
-Dashboard sangat bergantung pada kualitas `dataset_ulasan_tokopedia.csv`. Jika CSV berisi metadata halaman seperti `Detail Produk`, `Tentang Produk Ini`, atau semua rating bernilai `0`, berarti scraper belum mendapatkan section ulasan yang valid.
+Dataset valid harus berisi review asli dari pengguna. Contoh data yang tidak valid:
 
-Saat kondisi itu terjadi:
+- `Detail Produk`
+- `Tentang Produk Ini`
+- `Ada masalah dengan produk ini?`
+- ringkasan rating tanpa teks komentar
+
+Jika data seperti itu muncul:
 
 - Jalankan ulang scraper tanpa cache.
-- Pastikan URL produk memiliki ulasan.
-- Jalankan mode non-headless agar halaman bisa dipantau.
-- Cek debug snapshot jika scraper gagal menemukan ulasan.
-- Perketat filter ekstraksi sebelum memakai dataset untuk analisis.
+- Gunakan URL produk langsung atau short-link Tokopedia yang valid.
+- Pastikan produk memang memiliki ulasan teks.
+- Cek log pada tab `2 Scraping`.
+- Pastikan dependency `curl_cffi` sudah terpasang.
 
 ## File Generated Yang Tidak Perlu Disimpan
 
@@ -225,4 +305,4 @@ File/folder berikut bersifat generated dan bisa dibuat ulang:
 - `debug_*.txt`
 - `*.pyc`
 
-Virtual environment seperti `nlp_env/` juga tidak ideal masuk Git. Folder ini masih boleh ada secara lokal untuk menjalankan project, tetapi sebaiknya repository hanya menyimpan dependency list seperti `requirements_final.txt`.
+Virtual environment seperti `nlp_env/` juga tidak ideal masuk Git. Repository cukup menyimpan daftar dependency di `requirements_final.txt`.
